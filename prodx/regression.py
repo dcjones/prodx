@@ -12,35 +12,35 @@ import numpyro
 import numpyro.distributions as dist
 import pandas as pd
 
-def model(X, A, design):
+def model(X, A, design, batch_size):
     ncells, ngenes = X.shape
     ncovariates = design.shape[1]
 
     w = numpyro.sample("w", dist.Normal(jnp.zeros((ncovariates, ngenes)), jnp.full((ncovariates, ngenes), 1.0)))
-    # c = numpyro.sample("c", dist.LogNormal(jnp.zeros(ngenes), jnp.full(ngenes, 1.0)))
-    w_c = numpyro.sample("w_c", dist.Normal(jnp.zeros((ncovariates, ngenes)), jnp.full((ncovariates, ngenes), 1.0)))
+    c = numpyro.sample("c", dist.LogNormal(jnp.zeros(ngenes), jnp.full(ngenes, 1.0)))
 
-    nb_mean = jnp.exp(design@w)
-    nb_c = jnp.exp(design@w_c)
+    with numpyro.plate("cells", ncells, subsample_size=batch_size, dim=-2) as ind, numpyro.plate("genes", ngenes, dim=-1):
+        X_batch = X[ind]
+        design_batch = design[ind]
+        nb_mean = jnp.exp(design_batch@w)
 
-    if A is not None:
-        # This actually is bit nutty. What I should be doing is passing the adjacency matrix here
-        # and multiplying nb_mean to diffuse it
-        b_diffusion = numpyro.sample(
-            "b",
-            dist.HalfCauchy(jnp.full(ngenes, 1e-1)))
-        nb_mean += b_diffusion * (A @ nb_mean)
+        if A is not None:
+            # This actually is bit nutty. What I should be doing is passing the adjacency matrix here
+            # and multiplying nb_mean to diffuse it
+            b_diffusion = numpyro.sample(
+                "b",
+                dist.HalfCauchy(jnp.full(ngenes, 1e-1)))
+            nb_mean += b_diffusion * (A @ nb_mean)
 
-    numpyro.sample(
-        "X",
-        dist.NegativeBinomial2(
-            mean=nb_mean,
-            # concentration=jnp.repeat(jnp.expand_dims(c, 0), ncells, axis=0),
-            concentration=nb_c,
-        ),
-        obs=X)
+        numpyro.sample(
+            "X",
+            dist.NegativeBinomial2(
+                mean=nb_mean,
+                concentration=jnp.repeat(jnp.expand_dims(c, 0), nb_mean.shape[0], axis=0),
+            ),
+            obs=X_batch)
 
-def guide(X, A, design):
+def guide(X, A, design, batch_size):
     ncells, ngenes = X.shape
     ncovariates = design.shape[1]
 
@@ -48,21 +48,17 @@ def guide(X, A, design):
     w_sigma_q = numpyro.param("w_sigma_q", jnp.ones((ncovariates, ngenes)), constraint=dist.constraints.positive)
     numpyro.sample("w", dist.Normal(w_mu_q, w_sigma_q))
 
-    w_c_mu_q = numpyro.param("w_c_mu_q", jnp.zeros((ncovariates, ngenes)))
-    w_c_sigma_q = numpyro.param("w_c_sigma_q", jnp.ones((ncovariates, ngenes)), constraint=dist.constraints.positive)
-    numpyro.sample("w_c", dist.Normal(w_c_mu_q, w_c_sigma_q))
-
     if A is not None:
         b_mu_q = numpyro.param("b_mu_q", jnp.zeros(ngenes))
         b_sigma_q = numpyro.param("b_sigma_q", jnp.ones(ngenes), constraint=dist.constraints.positive)
         numpyro.sample("b", dist.LogNormal(b_mu_q, b_sigma_q))
 
-    # c_mu_q = numpyro.param("c_mu_q", jnp.zeros(ngenes))
-    # c_sigma_q = numpyro.param("c_sigma_q", jnp.ones(ngenes), constraint=dist.constraints.positive)
-    # numpyro.sample("c", dist.LogNormal(c_mu_q, c_sigma_q))
+    c_mu_q = numpyro.param("c_mu_q", jnp.zeros(ngenes))
+    c_sigma_q = numpyro.param("c_sigma_q", jnp.ones(ngenes), constraint=dist.constraints.positive)
+    numpyro.sample("c", dist.LogNormal(c_mu_q, c_sigma_q))
 
 
-def run_inference_vi(X, A, design, nsamples):
+def run_inference_vi(X, A, design, batch_size, nsamples):
     optimizer = numpyro.optim.Adam(step_size=0.02)
     svi = SVI(model, guide, optimizer, loss=Trace_ELBO())
 
@@ -71,7 +67,8 @@ def run_inference_vi(X, A, design, nsamples):
         key, nsamples,
         X=jnp.array(X, dtype=jnp.float32),
         A=A,
-        design=jnp.array(design, dtype=jnp.float32))
+        design=jnp.array(design, dtype=jnp.float32),
+        batch_size=batch_size)
     params = {
         k: np.asarray(v) for k, v in params.items()
     }
@@ -81,10 +78,8 @@ def merge_inferred_params(param_chunks: list):
     params = {
         "w_mu_q": np.concatenate([chunk["w_mu_q"] for chunk in param_chunks], axis=1),
         "w_sigma_q": np.concatenate([chunk["w_sigma_q"] for chunk in param_chunks], axis=1),
-        "W_c_mu_q": np.concatenate([chunk["w_c_mu_q"] for chunk in param_chunks], axis=1),
-        "w_c_sigma_q": np.concatenate([chunk["w_c_sigma_q"] for chunk in param_chunks], axis=1),
-        # "c_mu_q": np.concatenate([chunk["c_mu_q"] for chunk in param_chunks], axis=0),
-        # "c_sigma_q": np.concatenate([chunk["c_sigma_q"] for chunk in param_chunks], axis=0),
+        "c_mu_q": np.concatenate([chunk["c_mu_q"] for chunk in param_chunks], axis=0),
+        "c_sigma_q": np.concatenate([chunk["c_sigma_q"] for chunk in param_chunks], axis=0),
     }
 
     if "b_mu_q" in param_chunks[0]:
@@ -95,7 +90,7 @@ def merge_inferred_params(param_chunks: list):
     return params
 
 class DEModel:
-    def __init__(self, adata: AnnData, formula: str, model_segmentation_error: bool=False, max_edge_dist=15.0):
+    def __init__(self, adata: AnnData, formula: str, negctrl_pat:str="^NegControl", model_segmentation_error: bool=False, max_edge_dist=15.0):
         self.adata = adata
         self.design = dmatrix(formula, adata.obs)
 
@@ -129,20 +124,13 @@ class DEModel:
         else:
             self.A = None
 
-    def fit(self, nsamples=4000, chunksize=64):
-        # I think we have to do this in chunks!
-        param_chunks = []
-        ngenes = self.adata.shape[1]
-        for j in range(0, ngenes, chunksize):
-            # Calculate the actual size of this chunk (might be smaller for last chunk)
-            current_chunksize = min(chunksize, ngenes - j)
-            print(current_chunksize)
-            param_chunks.append(run_inference_vi(
-                self.adata.X[:,j:j+current_chunksize],
-                self.A,
-                self.design, nsamples=nsamples))
-
-        params = merge_inferred_params(param_chunks)
+    def fit(self, nsamples=4000, batch_size=1024):
+        params = run_inference_vi(
+            self.adata.X,
+            self.A,
+            self.design,
+            batch_size=batch_size,
+            nsamples=nsamples)
 
         # posterior mean coefficient estimates (should we convert these to log2?)
         coefs = pd.DataFrame(
