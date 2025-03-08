@@ -24,7 +24,8 @@ def model(X: jax.Array, A: BCOO, design: jax.Array, negctrl_mask: jax.Array, bat
     ncovariates = design.shape[1]
 
     w = numpyro.sample("w", dist.Normal(jnp.zeros((ncovariates, ngenes)), jnp.full((ncovariates, ngenes), 1.0)))
-    b = numpyro.sample("b", dist.LogNormal(jnp.zeros((ncovariates-1, 1)), jnp.full((ncovariates-1, 1), 1.0)))
+    b_mul = numpyro.sample("b_mul", dist.Normal(jnp.zeros((ncovariates-1, 1)), jnp.full((ncovariates-1, 1), 1.0)))
+    b_add = numpyro.sample("b_add", dist.LogNormal(jnp.zeros((ncovariates-1, 1)), jnp.full((ncovariates-1, 1), 1.0)))
     c = numpyro.sample("c", dist.LogNormal(jnp.zeros(ngenes), jnp.full(ngenes, 1.0)))
 
     with numpyro.plate("cells", ncells, subsample_size=batch_size, dim=-2) as ind, numpyro.plate("genes", ngenes, dim=-1):
@@ -33,13 +34,18 @@ def model(X: jax.Array, A: BCOO, design: jax.Array, negctrl_mask: jax.Array, bat
         design_batch_no_intercept = design_batch[:,1:] # [batch_size, ncovariates-1]
 
 
+        # TODO: trying something here
+        # design_batch_no_intercept = design_batch[:,2:] # [batch_size, ncovariates-1]
+        # design_batch = design_batch[:,:1]
+
         # TODO: Need to make the second term optional when there are no negative
         # controls to avoid degenerate solutions.
 
-
         # TODO: The bigger issue is regressing this additive noise term won't work for general design matrices.
 
-        nb_mean = jnp.exp(design_batch@(w*negctrl_mask)) + design_batch_no_intercept@b # [batch_size, ngenes]
+        # TODO: Maybe we also have a multiplicate bias thing here (similar to what we are doing with `b`, but stick it in the exp())
+
+        nb_mean = jnp.exp(design_batch@(w*negctrl_mask) + design_batch_no_intercept@b_mul) + design_batch_no_intercept@b_add # [batch_size, ngenes]
 
         # TODO: We'll need to subsample the adjacency matrix once
         # we start trying to make this work again
@@ -67,9 +73,13 @@ def guide(X, A, design, negctrl_mask, batch_size):
     w_sigma_q = numpyro.param("w_sigma_q", jnp.ones((ncovariates, ngenes)), constraint=dist.constraints.positive)
     numpyro.sample("w", dist.Normal(w_mu_q, w_sigma_q))
 
-    b_mu_q = numpyro.param("b_mu_q", jnp.zeros((ncovariates-1, 1)))
-    b_sigma_q = numpyro.param("b_sigma_q", jnp.ones((ncovariates-1, 1)), constraint=dist.constraints.positive)
-    numpyro.sample("b", dist.LogNormal(b_mu_q, b_sigma_q))
+    b_mul_mu_q = numpyro.param("b_mul_mu_q", jnp.zeros((ncovariates-1, 1)))
+    b_mul_sigma_q = numpyro.param("b_mul_sigma_q", jnp.ones((ncovariates-1, 1)), constraint=dist.constraints.positive)
+    numpyro.sample("b_mul", dist.Normal(b_mul_mu_q, b_mul_sigma_q))
+
+    b_add_mu_q = numpyro.param("b_add_mu_q", jnp.zeros((ncovariates-1, 1)))
+    b_add_sigma_q = numpyro.param("b_add_sigma_q", jnp.ones((ncovariates-1, 1)), constraint=dist.constraints.positive)
+    numpyro.sample("b_add", dist.LogNormal(b_add_mu_q, b_add_sigma_q))
 
     # if A is not None:
     #     b_mu_q = numpyro.param("b_mu_q", jnp.zeros(ngenes))
@@ -102,12 +112,18 @@ class DEModel:
     def __init__(self, adata: AnnData, formula: str, negctrl_pat:str="^NegControl", model_segmentation_error: bool=False, max_edge_dist=15.0):
         self.adata = adata
         self.design = dmatrix(formula, adata.obs)
+
+        print(self.design.design_info.column_names)
+
         ncovariates = self.design.shape[1]
 
         negctrl_mask = np.array([re.match(negctrl_pat, gene) is None for gene in adata.var_names], dtype=bool)
         nnegctrls = np.sum(~negctrl_mask)
         negctrl_mask = np.repeat(np.expand_dims(negctrl_mask, 0), ncovariates, axis=0) # mask out regression coefficients for negative controls
+
+        # TODO: I don't think this masking is really necessary, but maybe it's safer to do so.
         negctrl_mask[0,:] = True # allow intercepts for negative controls
+        # negctrl_mask[:] = True # allow intercepts for negative controls
         self.negctrl_mask = negctrl_mask
         print(f"{nnegctrls} negative controls")
 
@@ -153,7 +169,8 @@ class DEModel:
             batch_size=batch_size,
             nsamples=nsamples)
 
-        print(params["b_mu_q"])
+        print(params["b_add_mu_q"])
+        print(params["b_mul_mu_q"])
 
         # posterior mean coefficient estimates (should we convert these to log2?)
         coefs = pd.DataFrame(
