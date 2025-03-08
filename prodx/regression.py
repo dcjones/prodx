@@ -2,6 +2,7 @@
 from anndata import AnnData
 from jax.experimental.sparse import BCOO
 from numpyro.infer import SVI, Trace_ELBO
+from pandas._libs.algos import nancorr
 from patsy import dmatrix
 from scipy.sparse import coo_matrix
 from scipy.spatial import Delaunay
@@ -11,26 +12,44 @@ import numpy as np
 import numpyro
 import numpyro.distributions as dist
 import pandas as pd
+import re
 
-def model(X, A, design, batch_size):
+# X: [ncells, ngenes]
+# A: [ncells, ngenes] (sparse matrix)
+# design: [ncells, ncovariates]
+# negctrl_mask: [ncovariates, ngenes]
+# batch_size: int
+def model(X: jax.Array, A: BCOO, design: jax.Array, negctrl_mask: jax.Array, batch_size: int):
     ncells, ngenes = X.shape
     ncovariates = design.shape[1]
 
     w = numpyro.sample("w", dist.Normal(jnp.zeros((ncovariates, ngenes)), jnp.full((ncovariates, ngenes), 1.0)))
+    b = numpyro.sample("b", dist.LogNormal(jnp.zeros((ncovariates-1, 1)), jnp.full((ncovariates-1, 1), 1.0)))
     c = numpyro.sample("c", dist.LogNormal(jnp.zeros(ngenes), jnp.full(ngenes, 1.0)))
 
     with numpyro.plate("cells", ncells, subsample_size=batch_size, dim=-2) as ind, numpyro.plate("genes", ngenes, dim=-1):
-        X_batch = X[ind]
-        design_batch = design[ind]
-        nb_mean = jnp.exp(design_batch@w)
+        X_batch = X[ind] # [batch_size, ngenes]
+        design_batch = design[ind] # [batch_size, ncovariates]
+        design_batch_no_intercept = design_batch[:,1:] # [batch_size, ncovariates-1]
 
-        if A is not None:
-            # This actually is bit nutty. What I should be doing is passing the adjacency matrix here
-            # and multiplying nb_mean to diffuse it
-            b_diffusion = numpyro.sample(
-                "b",
-                dist.HalfCauchy(jnp.full(ngenes, 1e-1)))
-            nb_mean += b_diffusion * (A @ nb_mean)
+
+        # TODO: Need to make the second term optional when there are no negative
+        # controls to avoid degenerate solutions.
+
+
+        # TODO: The bigger issue is regressing this additive noise term won't work for general design matrices.
+
+        nb_mean = jnp.exp(design_batch@(w*negctrl_mask)) + design_batch_no_intercept@b # [batch_size, ngenes]
+
+        # TODO: We'll need to subsample the adjacency matrix once
+        # we start trying to make this work again
+        # if A is not None:
+        #     # This actually is bit nutty. What I should be doing is passing the adjacency matrix here
+        #     # and multiplying nb_mean to diffuse it
+        #     b_diffusion = numpyro.sample(
+        #         "b",
+        #         dist.HalfCauchy(jnp.full(ngenes, 1e-1)))
+        #     nb_mean += b_diffusion * (A @ nb_mean)
 
         numpyro.sample(
             "X",
@@ -40,7 +59,7 @@ def model(X, A, design, batch_size):
             ),
             obs=X_batch)
 
-def guide(X, A, design, batch_size):
+def guide(X, A, design, negctrl_mask, batch_size):
     ncells, ngenes = X.shape
     ncovariates = design.shape[1]
 
@@ -48,17 +67,21 @@ def guide(X, A, design, batch_size):
     w_sigma_q = numpyro.param("w_sigma_q", jnp.ones((ncovariates, ngenes)), constraint=dist.constraints.positive)
     numpyro.sample("w", dist.Normal(w_mu_q, w_sigma_q))
 
-    if A is not None:
-        b_mu_q = numpyro.param("b_mu_q", jnp.zeros(ngenes))
-        b_sigma_q = numpyro.param("b_sigma_q", jnp.ones(ngenes), constraint=dist.constraints.positive)
-        numpyro.sample("b", dist.LogNormal(b_mu_q, b_sigma_q))
+    b_mu_q = numpyro.param("b_mu_q", jnp.zeros((ncovariates-1, 1)))
+    b_sigma_q = numpyro.param("b_sigma_q", jnp.ones((ncovariates-1, 1)), constraint=dist.constraints.positive)
+    numpyro.sample("b", dist.LogNormal(b_mu_q, b_sigma_q))
+
+    # if A is not None:
+    #     b_mu_q = numpyro.param("b_mu_q", jnp.zeros(ngenes))
+    #     b_sigma_q = numpyro.param("b_sigma_q", jnp.ones(ngenes), constraint=dist.constraints.positive)
+    #     numpyro.sample("b", dist.LogNormal(b_mu_q, b_sigma_q))
 
     c_mu_q = numpyro.param("c_mu_q", jnp.zeros(ngenes))
     c_sigma_q = numpyro.param("c_sigma_q", jnp.ones(ngenes), constraint=dist.constraints.positive)
     numpyro.sample("c", dist.LogNormal(c_mu_q, c_sigma_q))
 
 
-def run_inference_vi(X, A, design, batch_size, nsamples):
+def run_inference_vi(X, A, design, negctrl_mask, batch_size, nsamples):
     optimizer = numpyro.optim.Adam(step_size=0.02)
     svi = SVI(model, guide, optimizer, loss=Trace_ELBO())
 
@@ -68,31 +91,25 @@ def run_inference_vi(X, A, design, batch_size, nsamples):
         X=jnp.array(X, dtype=jnp.float32),
         A=A,
         design=jnp.array(design, dtype=jnp.float32),
+        negctrl_mask=jnp.array(negctrl_mask, dtype=jnp.float32),
         batch_size=batch_size)
     params = {
         k: np.asarray(v) for k, v in params.items()
     }
     return params
 
-def merge_inferred_params(param_chunks: list):
-    params = {
-        "w_mu_q": np.concatenate([chunk["w_mu_q"] for chunk in param_chunks], axis=1),
-        "w_sigma_q": np.concatenate([chunk["w_sigma_q"] for chunk in param_chunks], axis=1),
-        "c_mu_q": np.concatenate([chunk["c_mu_q"] for chunk in param_chunks], axis=0),
-        "c_sigma_q": np.concatenate([chunk["c_sigma_q"] for chunk in param_chunks], axis=0),
-    }
-
-    if "b_mu_q" in param_chunks[0]:
-        params["b_mu_q"] = np.concatenate([chunk["b_mu_q"] for chunk in param_chunks], axis=0)
-    if "b_sigma_q" in param_chunks[0]:
-        params["b_sigma_q"] = np.concatenate([chunk["b_sigma_q"] for chunk in param_chunks], axis=0)
-
-    return params
-
 class DEModel:
     def __init__(self, adata: AnnData, formula: str, negctrl_pat:str="^NegControl", model_segmentation_error: bool=False, max_edge_dist=15.0):
         self.adata = adata
         self.design = dmatrix(formula, adata.obs)
+        ncovariates = self.design.shape[1]
+
+        negctrl_mask = np.array([re.match(negctrl_pat, gene) is None for gene in adata.var_names], dtype=bool)
+        nnegctrls = np.sum(~negctrl_mask)
+        negctrl_mask = np.repeat(np.expand_dims(negctrl_mask, 0), ncovariates, axis=0) # mask out regression coefficients for negative controls
+        negctrl_mask[0,:] = True # allow intercepts for negative controls
+        self.negctrl_mask = negctrl_mask
+        print(f"{nnegctrls} negative controls")
 
         if model_segmentation_error:
             if "spatial" not in adata.obsm:
@@ -124,13 +141,19 @@ class DEModel:
         else:
             self.A = None
 
-    def fit(self, nsamples=4000, batch_size=1024):
+    def fit(self, nsamples=6000, batch_size=1024):
+        # TODO: We should try doing proper data loading and train on GPU.
+        numpyro.set_platform("cpu")
+
         params = run_inference_vi(
             self.adata.X,
             self.A,
             self.design,
+            self.negctrl_mask,
             batch_size=batch_size,
             nsamples=nsamples)
+
+        print(params["b_mu_q"])
 
         # posterior mean coefficient estimates (should we convert these to log2?)
         coefs = pd.DataFrame(
