@@ -5,6 +5,7 @@ from numpyro.infer import SVI, Trace_ELBO
 from patsy import dmatrix
 from scipy.sparse import coo_matrix
 from scipy.spatial import Delaunay
+from scipy.stats import norm
 from typing import Optional
 import jax
 import jax.numpy as jnp
@@ -107,6 +108,7 @@ def run_inference_vi(X, A, design, confounder_design, negctrl_mask, batch_size, 
 
 class DEModel:
     def __init__(self, adata: AnnData, formula: str, confounder_formula: Optional[str]=None, negctrl_pat:str="^NegControl", model_segmentation_error: bool=False, max_edge_dist=15.0):
+        self.params = None
         self.adata = adata
         self.design = dmatrix(formula, adata.obs)
         if confounder_formula is not None:
@@ -164,11 +166,30 @@ class DEModel:
     def confounder_matrix(self):
         return self.confounder_design
 
+    @property
+    def fitted_params(self):
+        self._check_is_fit()
+        return self.params
+
+    def _check_is_fit(self) -> None:
+        if self.params is None:
+            raise ValueError("Model must be fit before running inference. Call .fit() first")
+
+    def get_design_column_idx(self, col: str | int) -> int:
+        """Get a design matrix column index by name."""
+        if isinstance(col, int):
+            return col
+        elif not isinstance(col, str):
+            raise ValueError("Column must be string.")
+        if col not in self.design.design_info.column_names:
+            raise ValueError(f"Column {col} not found in design matrix.")
+        return self.design.design_info.column_names.index(col)
+
     def fit(self, nsamples=6000, batch_size=1024):
         # TODO: We should try doing proper data loading and train on GPU.
         numpyro.set_platform("cpu")
 
-        params = run_inference_vi(
+        self.params = run_inference_vi(
             self.adata.X,
             self.A,
             self.design,
@@ -177,17 +198,36 @@ class DEModel:
             batch_size=batch_size,
             nsamples=nsamples)
 
-        # posterior mean coefficient estimates (should we convert these to log2?)
-        coefs = pd.DataFrame(
-            np.asarray(params["w_mu_q"]).transpose(),
-            columns=self.design.design_info.column_names,
-            index=self.adata.var_names,
-        )
+    def _de_results(self, covariate: str|int, minfc, credible):
+        self._check_is_fit()
+        log_minfc = np.log(minfc)
+        j = self.get_design_column_idx(covariate)
+        ngenes = self.params["w_mu_q"].shape[1]
 
-        sds = pd.DataFrame(
-            np.asarray(params["w_sigma_q"]).transpose(),
-            columns=self.design.design_info.column_names,
-            index=self.adata.var_names,
-        )
+        posterior_mean = self.params["w_mu_q"][j,:]
+        lower_credibles = np.zeros(ngenes, dtype=np.float32)
+        upper_credibles = np.zeros(ngenes, dtype=np.float32)
+        down_probs = np.zeros(ngenes, dtype=np.float32)
+        up_probs = np.zeros(ngenes, dtype=np.float32)
 
-        return coefs, sds
+        for (j, (μ, σ)) in enumerate(zip(self.params["w_mu_q"][j,:], self.params["w_sigma_q"][j,:])):
+            lower_credibles[j], upper_credibles[j] = norm.interval(credible, loc=μ, scale=σ)
+            down_probs[j] = norm.cdf(-log_minfc, loc=μ, scale=σ)
+            up_probs[j] = 1 - norm.cdf(log_minfc, loc=μ, scale=σ)
+
+        return posterior_mean, lower_credibles, upper_credibles, down_probs, up_probs
+
+    def de_results(self, covariate, minfc=1.5, credible=0.95):
+        j_intercept = self.get_design_column_idx("Intercept")
+        intercept_posterior_mean = self.params["w_mu_q"][j_intercept,:]
+        posterior_mean, lower_credibles, upper_credibles, down_probs, up_probs = self._de_results(covariate, minfc, credible)
+        return pd.DataFrame(dict(
+            gene=self.adata.var_names,
+            log10_base_mean=intercept_posterior_mean / np.log(10),
+            log2fc=posterior_mean / np.log(2),
+            log2fc_lower_credible=lower_credibles / np.log(2),
+            log2fc_upper_credible=upper_credibles / np.log(2),
+            de_down_prob=down_probs,
+            de_up_prob=up_probs,
+            de_prob=down_probs + up_probs
+        )).sort_values("de_prob", ascending=False)
