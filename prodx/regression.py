@@ -24,8 +24,9 @@ def model(X: jax.Array, A: BCOO, design: jax.Array, confounder_design: Optional[
     ncells, ngenes = X.shape
     ncovariates = design.shape[1]
 
-    w = numpyro.sample("w", dist.Normal(jnp.zeros((ncovariates, ngenes)), jnp.full((ncovariates, ngenes), 1.0)))
-    c = numpyro.sample("c", dist.LogNormal(jnp.zeros(ngenes), jnp.full(ngenes, 1.0)))
+    # w = numpyro.sample("w", dist.Normal(jnp.zeros((ncovariates, ngenes)), jnp.full((ncovariates, ngenes), 2.0)))
+    w = numpyro.sample("w", dist.Cauchy(jnp.zeros((ncovariates, ngenes)), jnp.full((ncovariates, ngenes), 1.0)))
+    overdispersion = numpyro.sample("c", dist.HalfCauchy(jnp.full(ngenes, 1e-1)))
 
     if confounder_design is not None:
         nconfounders = confounder_design.shape[1]
@@ -53,11 +54,36 @@ def model(X: jax.Array, A: BCOO, design: jax.Array, confounder_design: Optional[
         #         dist.HalfCauchy(jnp.full(ngenes, 1e-1)))
         #     nb_mean += b_diffusion * (A @ nb_mean)
 
+        # numpyro.sample(
+        #     "X",
+        #     dist.NegativeBinomial2(
+        #         mean=nb_mean,
+        #         concentration=jnp.repeat(jnp.expand_dims(c, 0), nb_mean.shape[0], axis=0),
+        #     ),
+        #     obs=X_batch)
+
+        # numpyro.sample(
+        #     "X",
+        #     dist.Poisson(
+        #         rate=nb_mean,
+        #     ),
+        #     obs=X_batch)
+
+        concentration = jnp.reciprocal(overdispersion)
+        # numpyro.sample(
+        #     "X",
+        #     dist.NegativeBinomial2(
+        #         mean=nb_mean,
+        #         # rate=nb_mean,
+        #         # concentration=np.repeat(jnp.expand_dims(concentration, 0), nb_mean.shape[0], axis=0),
+        #         concentration=10.0,
+        #     ),
+        #     obs=X_batch)
+
         numpyro.sample(
             "X",
-            dist.NegativeBinomial2(
-                mean=nb_mean,
-                concentration=jnp.repeat(jnp.expand_dims(c, 0), nb_mean.shape[0], axis=0),
+            dist.Poisson(
+                rate=nb_mean,
             ),
             obs=X_batch)
 
@@ -84,12 +110,12 @@ def guide(X, A, design, confounder_design: Optional[jax.Array], negctrl_mask, ba
         b_mul_sigma_q = numpyro.param("b_mul_sigma_q", jnp.ones((nconfounders, 1)), constraint=dist.constraints.positive)
         numpyro.sample("b_mul", dist.Normal(b_mul_mu_q, b_mul_sigma_q))
 
-        b_add_mu_q = numpyro.param("b_add_mu_q", jnp.zeros((nconfounders, 1)))
+        b_add_mu_q = numpyro.param("b_add_mu_q", jnp.full((nconfounders, 1), 1e-2))
         b_add_sigma_q = numpyro.param("b_add_sigma_q", jnp.ones((nconfounders, 1)), constraint=dist.constraints.positive)
         numpyro.sample("b_add", dist.LogNormal(b_add_mu_q, b_add_sigma_q))
 
 def run_inference_vi(X, A, design, confounder_design, negctrl_mask, batch_size, nsamples):
-    optimizer = numpyro.optim.Adam(step_size=0.02)
+    optimizer = numpyro.optim.Adam(step_size=0.04)
     svi = SVI(model, guide, optimizer, loss=Trace_ELBO())
 
     key = jax.random.PRNGKey(0)
@@ -98,7 +124,7 @@ def run_inference_vi(X, A, design, confounder_design, negctrl_mask, batch_size, 
         X=jnp.array(X, dtype=jnp.float32),
         A=A,
         design=jnp.array(design, dtype=jnp.float32),
-        confounder_design=jnp.array(confounder_design, dtype=jnp.float32),
+        confounder_design=jnp.array(confounder_design, dtype=jnp.float32) if confounder_design is not None else None,
         negctrl_mask=jnp.array(negctrl_mask, dtype=jnp.float32),
         batch_size=batch_size)
     params = {
@@ -107,7 +133,35 @@ def run_inference_vi(X, A, design, confounder_design, negctrl_mask, batch_size, 
     return params
 
 class DEModel:
-    def __init__(self, adata: AnnData, formula: str, confounder_formula: Optional[str]=None, negctrl_pat:str="^NegControl", model_segmentation_error: bool=False, max_edge_dist=15.0):
+    def __init__(
+        self,
+        adata: AnnData,
+        formula: str,
+        confounder_formula: Optional[str]=None,
+        negctrl_pat:str="^NegControl",
+        mask_negctrls: bool=False,
+        model_segmentation_error: bool=False,
+        max_edge_dist=15.0
+    ):
+        """A model for performing differential expression analysis.
+
+        Parameters
+        ----------
+        adata : AnnData
+            The AnnData object containing gene expression data.
+        formula : str
+            The model formula for the fixed effects in R-style syntax.
+        confounder_formula : Optional[str], default=None
+            The model formula for confounder variables in R-style syntax.
+        negctrl_pat : str, default="^NegControl"
+            Regular expression pattern to identify negative control genes.
+        mask_negctrls : bool, default=False
+            Whether to mask out regression coefficients for negative control genes.
+        model_segmentation_error : bool, default=False
+            Whether to model segmentation errors between adjacent cells.
+        max_edge_dist : float, default=15.0
+            Maximum distance between cells to be considered adjacent.
+        """
         self.params = None
         self.adata = adata
         self.design = dmatrix(formula, adata.obs)
@@ -117,16 +171,20 @@ class DEModel:
             self.confounder_design = None
 
         ncovariates = self.design.shape[1]
+        ngenes = adata.shape[1]
 
-        negctrl_mask = np.array([re.match(negctrl_pat, gene) is None for gene in adata.var_names], dtype=bool)
-        nnegctrls = np.sum(~negctrl_mask)
-        negctrl_mask = np.repeat(np.expand_dims(negctrl_mask, 0), ncovariates, axis=0) # mask out regression coefficients for negative controls
+        if mask_negctrls:
+            negctrl_mask = np.array([re.match(negctrl_pat, gene) is None for gene in adata.var_names], dtype=bool)
+            nnegctrls = np.sum(~negctrl_mask)
+            print(f"{nnegctrls} negative controls")
+            negctrl_mask = np.repeat(np.expand_dims(negctrl_mask, 0), ncovariates, axis=0) # mask out regression coefficients for negative controls
 
-        # TODO: I don't think this masking is really necessary, but maybe it's safer to do so.
-        negctrl_mask[0,:] = True # allow intercepts for negative controls
-        # negctrl_mask[:] = True # allow intercepts for negative controls
-        self.negctrl_mask = negctrl_mask
-        print(f"{nnegctrls} negative controls")
+            if "Intercept" in self.design.design_info.column_names:
+                negctrl_mask[0,:] = True # allow intercepts for negative controls
+
+            self.negctrl_mask = negctrl_mask
+        else:
+            self.negctrl_mask = np.ones((ncovariates, ngenes), dtype=bool)
 
         if model_segmentation_error:
             if "spatial" not in adata.obsm:
@@ -166,11 +224,6 @@ class DEModel:
     def confounder_matrix(self):
         return self.confounder_design
 
-    @property
-    def fitted_params(self):
-        self._check_is_fit()
-        return self.params
-
     def _check_is_fit(self) -> None:
         if self.params is None:
             raise ValueError("Model must be fit before running inference. Call .fit() first")
@@ -186,6 +239,20 @@ class DEModel:
         return self.design.design_info.column_names.index(col)
 
     def fit(self, nsamples=6000, batch_size=1024):
+        """Fit parameters to the dataset.
+
+        Parameters
+        ----------
+        nsamples : int, default=6000
+            Number of samples to draw during variational inference.
+        batch_size : int, default=1024
+            Mini-batch size for stochastic variational inference.
+
+        Returns
+        -------
+        None
+            Model parameters are stored in the self.params attribute.
+        """
         # TODO: We should try doing proper data loading and train on GPU.
         numpyro.set_platform("cpu")
 
@@ -218,6 +285,30 @@ class DEModel:
         return posterior_mean, lower_credibles, upper_credibles, down_probs, up_probs
 
     def de_results(self, covariate, minfc=1.5, credible=0.95):
+        """Return differential expression analysis results.
+
+        Parameters
+        ----------
+        covariate : str or int
+            The covariate name or index to test for differential expression.
+        minfc : float, default=1.5
+            Minimum fold change threshold.
+        credible : float, default=0.95
+            Credible interval width.
+
+        Returns
+        -------
+        pd.DataFrame
+            DataFrame containing differential expression analysis results with columns:
+            - gene: Gene name
+            - log10_base_mean: Log10 of base expression level
+            - log2fc: Log2 fold change
+            - log2fc_lower_credible: Lower bound of credible interval for log2fc
+            - log2fc_upper_credible: Upper bound of credible interval for log2fc
+            - de_down_prob: Probability of downregulation exceeding minfc
+            - de_up_prob: Probability of upregulation exceeding minfc
+            - de_prob: Total probability of differential expression
+        """
         j_intercept = self.get_design_column_idx("Intercept")
         intercept_posterior_mean = self.params["w_mu_q"][j_intercept,:]
         posterior_mean, lower_credibles, upper_credibles, down_probs, up_probs = self._de_results(covariate, minfc, credible)
