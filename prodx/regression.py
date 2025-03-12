@@ -24,14 +24,14 @@ def model(X: jax.Array, A: BCOO, design: jax.Array, confounder_design: Optional[
     ncells, ngenes = X.shape
     ncovariates = design.shape[1]
 
-    # w = numpyro.sample("w", dist.Normal(jnp.zeros((ncovariates, ngenes)), jnp.full((ncovariates, ngenes), 2.0)))
-    w = numpyro.sample("w", dist.Cauchy(jnp.zeros((ncovariates, ngenes)), jnp.full((ncovariates, ngenes), 1.0)))
-    overdispersion = numpyro.sample("c", dist.HalfCauchy(jnp.full(ngenes, 1e-1)))
+    σw = numpyro.sample("σw", dist.HalfCauchy(jnp.full(ncovariates, 1e-1)))
+    w = numpyro.sample("w", dist.Normal(jnp.zeros((ncovariates, ngenes)), jnp.expand_dims(σw, 1)))
+    overdispersion = numpyro.sample("c", dist.HalfCauchy(jnp.full(ngenes, 10.0)))
 
     if confounder_design is not None:
         nconfounders = confounder_design.shape[1]
-        b_mul = numpyro.sample("b_mul", dist.Normal(jnp.zeros((nconfounders, 1)), jnp.full((nconfounders, 1), 1.0)))
-        b_add = numpyro.sample("b_add", dist.LogNormal(jnp.zeros((nconfounders, 1)), jnp.full((nconfounders, 1), 1.0)))
+        b_mul = numpyro.sample("b_mul", dist.Normal(jnp.zeros(nconfounders), jnp.full(nconfounders, 1.0)))
+        b_add = numpyro.sample("b_add", dist.LogNormal(jnp.zeros(nconfounders), jnp.full(nconfounders, 1.0)))
 
     with numpyro.plate("cells", ncells, subsample_size=batch_size, dim=-2) as ind, numpyro.plate("genes", ngenes, dim=-1):
         X_batch = X[ind] # [batch_size, ngenes]
@@ -40,7 +40,7 @@ def model(X: jax.Array, A: BCOO, design: jax.Array, confounder_design: Optional[
         base_exp = design_batch@(w*negctrl_mask)
         if confounder_design is not None:
             confounder_design_batch = confounder_design[ind] # [batch_size, nconfounders]
-            nb_mean = jnp.exp(base_exp + confounder_design_batch@b_mul) + confounder_design_batch@b_add # [batch_size, ngenes]
+            nb_mean = jnp.exp(base_exp + confounder_design_batch@jnp.expand_dims(b_mul, 1)) + confounder_design_batch@jnp.expand_dims(b_add, 1) # [batch_size, ngenes]
         else:
             nb_mean = jnp.exp(base_exp) # [batch_size, ngenes]
 
@@ -54,42 +54,21 @@ def model(X: jax.Array, A: BCOO, design: jax.Array, confounder_design: Optional[
         #         dist.HalfCauchy(jnp.full(ngenes, 1e-1)))
         #     nb_mean += b_diffusion * (A @ nb_mean)
 
-        # numpyro.sample(
-        #     "X",
-        #     dist.NegativeBinomial2(
-        #         mean=nb_mean,
-        #         concentration=jnp.repeat(jnp.expand_dims(c, 0), nb_mean.shape[0], axis=0),
-        #     ),
-        #     obs=X_batch)
-
-        # numpyro.sample(
-        #     "X",
-        #     dist.Poisson(
-        #         rate=nb_mean,
-        #     ),
-        #     obs=X_batch)
-
-        concentration = jnp.reciprocal(overdispersion)
-        # numpyro.sample(
-        #     "X",
-        #     dist.NegativeBinomial2(
-        #         mean=nb_mean,
-        #         # rate=nb_mean,
-        #         # concentration=np.repeat(jnp.expand_dims(concentration, 0), nb_mean.shape[0], axis=0),
-        #         concentration=10.0,
-        #     ),
-        #     obs=X_batch)
-
         numpyro.sample(
             "X",
-            dist.Poisson(
-                rate=nb_mean,
+            dist.NegativeBinomial2(
+                mean=nb_mean,
+                concentration=jnp.expand_dims(jnp.reciprocal(overdispersion), 0)
             ),
             obs=X_batch)
 
 def guide(X, A, design, confounder_design: Optional[jax.Array], negctrl_mask, batch_size):
     ncells, ngenes = X.shape
     ncovariates = design.shape[1]
+
+    σw_mu_q = numpyro.param("σw_mu_q", jnp.zeros(ncovariates))
+    σw_sigma_q = numpyro.param("σw_sigma_q", jnp.ones(ncovariates), constraint=dist.constraints.positive)
+    σw_q = numpyro.sample("σw", dist.LogNormal(σw_mu_q, σw_sigma_q))
 
     w_mu_q = numpyro.param("w_mu_q", jnp.zeros((ncovariates, ngenes)))
     w_sigma_q = numpyro.param("w_sigma_q", jnp.ones((ncovariates, ngenes)), constraint=dist.constraints.positive)
@@ -100,22 +79,23 @@ def guide(X, A, design, confounder_design: Optional[jax.Array], negctrl_mask, ba
     #     b_sigma_q = numpyro.param("b_sigma_q", jnp.ones(ngenes), constraint=dist.constraints.positive)
     #     numpyro.sample("b", dist.LogNormal(b_mu_q, b_sigma_q))
 
-    c_mu_q = numpyro.param("c_mu_q", jnp.zeros(ngenes))
+    c_mu_q = numpyro.param("c_mu_q", jnp.full(ngenes, 0.0))
     c_sigma_q = numpyro.param("c_sigma_q", jnp.ones(ngenes), constraint=dist.constraints.positive)
     numpyro.sample("c", dist.LogNormal(c_mu_q, c_sigma_q))
 
     if confounder_design is not None:
         nconfounders = confounder_design.shape[1]
-        b_mul_mu_q = numpyro.param("b_mul_mu_q", jnp.zeros((nconfounders, 1)))
-        b_mul_sigma_q = numpyro.param("b_mul_sigma_q", jnp.ones((nconfounders, 1)), constraint=dist.constraints.positive)
+        b_mul_mu_q = numpyro.param("b_mul_mu_q", jnp.zeros(nconfounders))
+        b_mul_sigma_q = numpyro.param("b_mul_sigma_q", jnp.ones(nconfounders), constraint=dist.constraints.positive)
         numpyro.sample("b_mul", dist.Normal(b_mul_mu_q, b_mul_sigma_q))
 
-        b_add_mu_q = numpyro.param("b_add_mu_q", jnp.full((nconfounders, 1), 1e-2))
-        b_add_sigma_q = numpyro.param("b_add_sigma_q", jnp.ones((nconfounders, 1)), constraint=dist.constraints.positive)
+        b_add_mu_q = numpyro.param("b_add_mu_q", jnp.full(nconfounders, 1e-2))
+        b_add_sigma_q = numpyro.param("b_add_sigma_q", jnp.ones(nconfounders), constraint=dist.constraints.positive)
         numpyro.sample("b_add", dist.LogNormal(b_add_mu_q, b_add_sigma_q))
 
+
 def run_inference_vi(X, A, design, confounder_design, negctrl_mask, batch_size, nsamples):
-    optimizer = numpyro.optim.Adam(step_size=0.04)
+    optimizer = numpyro.optim.Adam(step_size=0.02)
     svi = SVI(model, guide, optimizer, loss=Trace_ELBO())
 
     key = jax.random.PRNGKey(0)
@@ -167,6 +147,7 @@ class DEModel:
         self.design = dmatrix(formula, adata.obs)
         if confounder_formula is not None:
             self.confounder_design = dmatrix(confounder_formula, adata.obs)
+            # TODO: We might forcibly exclude an Intercept column if there is one
         else:
             self.confounder_design = None
 
@@ -312,6 +293,11 @@ class DEModel:
         j_intercept = self.get_design_column_idx("Intercept")
         intercept_posterior_mean = self.params["w_mu_q"][j_intercept,:]
         posterior_mean, lower_credibles, upper_credibles, down_probs, up_probs = self._de_results(covariate, minfc, credible)
+        effect_size = np.maximum(
+            np.clip(lower_credibles, 0, np.inf),
+            -np.clip(upper_credibles, -np.inf, 0)
+        )
+
         return pd.DataFrame(dict(
             gene=self.adata.var_names,
             log10_base_mean=intercept_posterior_mean / np.log(10),
@@ -320,5 +306,6 @@ class DEModel:
             log2fc_upper_credible=upper_credibles / np.log(2),
             de_down_prob=down_probs,
             de_up_prob=up_probs,
-            de_prob=down_probs + up_probs
-        )).sort_values("de_prob", ascending=False)
+            de_prob=down_probs + up_probs,
+            abs_log2fc_bound=effect_size / np.log(2),
+        )).sort_values("abs_log2fc_bound", ascending=False)
