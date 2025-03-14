@@ -1,11 +1,12 @@
-
 from anndata import AnnData
 from jax.experimental.sparse import BCOO
+from numpy.typing import ArrayLike
 from numpyro.infer import SVI, Trace_ELBO
 from patsy import dmatrix
 from scipy.sparse import coo_matrix
 from scipy.spatial import Delaunay
 from scipy.stats import norm
+from tqdm import tqdm
 from typing import Optional
 import jax
 import jax.numpy as jnp
@@ -15,13 +16,56 @@ import numpyro.distributions as dist
 import pandas as pd
 import re
 
+
+# basic dataset representation to do minibatch sampling
+class Dataset:
+    def __init__(self, X: ArrayLike, design: ArrayLike, confounder_design: Optional[ArrayLike]):
+        self.X = X # leave this as potentially a csr matrix
+        self.design = np.asarray(design)
+        self.confounder_design = np.asarray(confounder_design) if confounder_design is not None else None
+        self.ncells = self.X.shape[0]
+        self.rng = np.random.default_rng()
+        assert self.X.shape[0] == self.ncells
+        assert self.design.shape[0] == self.ncells
+        assert self.confounder_design.shape[0] == self.ncells
+
+    def __len__(self):
+        return self.ncells
+
+    def iter_batches(self, batch_size: int):
+        steps = (self.ncells + batch_size - 1) // batch_size # ceil
+        indices = self.rng.permutation(self.ncells)
+        mask = np.ones((batch_size, 1), dtype=bool)
+
+        for i in range(steps):
+            start = i * batch_size
+            end = min(start + batch_size, self.ncells)
+            batch_indices = indices[start:end]
+
+            X_batch = jnp.array(self.X[batch_indices,:])
+            design_batch = jnp.array(self.design.take(batch_indices, axis=0))
+            confounder_design_batch = jnp.array(self.confounder_design.take(batch_indices, axis=0)) if self.confounder_design is not None else None
+
+            if start + batch_size > self.ncells:
+                padlen = batch_size - (self.ncells - start)
+                mask[batch_size-padlen:,:] = False
+                pad_width = ((0, padlen), (0, 0))
+                X_batch = jnp.pad(X_batch, pad_width)
+                design_batch = jnp.pad(design_batch, pad_width)
+                confounder_design_batch = jnp.pad(confounder_design_batch, pad_width) if confounder_design_batch is not None else None
+                yield X_batch, design_batch, confounder_design_batch, mask
+            else:
+                yield X_batch, design_batch, confounder_design_batch, mask
+
+
 # X: [ncells, ngenes]
 # A: [ncells, ngenes] (sparse matrix)
 # design: [ncells, ncovariates]
 # negctrl_mask: [ncovariates, ngenes]
 # batch_size: int
-def model(X: jax.Array, A: BCOO, design: jax.Array, confounder_design: Optional[jax.Array], negctrl_mask: jax.Array, batch_size: int):
-    ncells, ngenes = X.shape
+def model(ncells, X: jax.Array, design: jax.Array, confounder_design: Optional[jax.Array], negctrl_mask: jax.Array, mask: jax.Array):
+
+    batch_size, ngenes = X.shape
     ncovariates = design.shape[1]
 
     σw = numpyro.sample("σw", dist.HalfCauchy(jnp.full(ncovariates, 1e-1)))
@@ -33,26 +77,12 @@ def model(X: jax.Array, A: BCOO, design: jax.Array, confounder_design: Optional[
         b_mul = numpyro.sample("b_mul", dist.Normal(jnp.zeros(nconfounders), jnp.full(nconfounders, 1.0)))
         b_add = numpyro.sample("b_add", dist.LogNormal(jnp.zeros(nconfounders), jnp.full(nconfounders, 1.0)))
 
-    with numpyro.plate("cells", ncells, subsample_size=batch_size, dim=-2) as ind, numpyro.plate("genes", ngenes, dim=-1):
-        X_batch = X[ind] # [batch_size, ngenes]
-        design_batch = design[ind] # [batch_size, ncovariates]
-
-        base_exp = design_batch@(w*negctrl_mask)
+    with numpyro.plate("cells", ncells, subsample_size=batch_size, dim=-2), numpyro.handlers.mask(mask=mask),  numpyro.plate("genes", ngenes, dim=-1):
+        base_exp = design@(w*negctrl_mask)
         if confounder_design is not None:
-            confounder_design_batch = confounder_design[ind] # [batch_size, nconfounders]
-            nb_mean = jnp.exp(base_exp + confounder_design_batch@jnp.expand_dims(b_mul, 1)) + confounder_design_batch@jnp.expand_dims(b_add, 1) # [batch_size, ngenes]
+            nb_mean = jnp.exp(base_exp + confounder_design@jnp.expand_dims(b_mul, 1)) + confounder_design@jnp.expand_dims(b_add, 1) # [batch_size, ngenes]
         else:
             nb_mean = jnp.exp(base_exp) # [batch_size, ngenes]
-
-        # TODO: We'll need to subsample the adjacency matrix once
-        # we start trying to make this work again
-        # if A is not None:
-        #     # This actually is bit nutty. What I should be doing is passing the adjacency matrix here
-        #     # and multiplying nb_mean to diffuse it
-        #     b_diffusion = numpyro.sample(
-        #         "b",
-        #         dist.HalfCauchy(jnp.full(ngenes, 1e-1)))
-        #     nb_mean += b_diffusion * (A @ nb_mean)
 
         numpyro.sample(
             "X",
@@ -60,9 +90,9 @@ def model(X: jax.Array, A: BCOO, design: jax.Array, confounder_design: Optional[
                 mean=nb_mean,
                 concentration=jnp.expand_dims(jnp.reciprocal(overdispersion), 0)
             ),
-            obs=X_batch)
+            obs=X)
 
-def guide(X, A, design, confounder_design: Optional[jax.Array], negctrl_mask, batch_size):
+def guide(ncells, X, design, confounder_design: Optional[jax.Array], negctrl_mask, mask: jax.Array):
     ncells, ngenes = X.shape
     ncovariates = design.shape[1]
 
@@ -73,11 +103,6 @@ def guide(X, A, design, confounder_design: Optional[jax.Array], negctrl_mask, ba
     w_mu_q = numpyro.param("w_mu_q", jnp.zeros((ncovariates, ngenes)))
     w_sigma_q = numpyro.param("w_sigma_q", jnp.ones((ncovariates, ngenes)), constraint=dist.constraints.positive)
     numpyro.sample("w", dist.Normal(w_mu_q, w_sigma_q))
-
-    # if A is not None:
-    #     b_mu_q = numpyro.param("b_mu_q", jnp.zeros(ngenes))
-    #     b_sigma_q = numpyro.param("b_sigma_q", jnp.ones(ngenes), constraint=dist.constraints.positive)
-    #     numpyro.sample("b", dist.LogNormal(b_mu_q, b_sigma_q))
 
     c_mu_q = numpyro.param("c_mu_q", jnp.full(ngenes, 0.0))
     c_sigma_q = numpyro.param("c_sigma_q", jnp.ones(ngenes), constraint=dist.constraints.positive)
@@ -143,16 +168,18 @@ class DEModel:
             Maximum distance between cells to be considered adjacent.
         """
         self.params = None
-        self.adata = adata
-        self.design = dmatrix(formula, adata.obs)
+        design = dmatrix(formula, adata.obs)
         if confounder_formula is not None:
-            self.confounder_design = dmatrix(confounder_formula, adata.obs)
+            confounder_design = dmatrix(confounder_formula, adata.obs)
             # TODO: We might forcibly exclude an Intercept column if there is one
         else:
-            self.confounder_design = None
+            confounder_design = None
 
-        ncovariates = self.design.shape[1]
-        ngenes = adata.shape[1]
+        self.data = Dataset(adata.X, design, confounder_design)
+        self.genes = adata.var_names
+
+        ncovariates = design.shape[1]
+        ngenes = len(self.genes)
 
         if mask_negctrls:
             negctrl_mask = np.array([re.match(negctrl_pat, gene) is None for gene in adata.var_names], dtype=bool)
@@ -160,7 +187,7 @@ class DEModel:
             print(f"{nnegctrls} negative controls")
             negctrl_mask = np.repeat(np.expand_dims(negctrl_mask, 0), ncovariates, axis=0) # mask out regression coefficients for negative controls
 
-            if "Intercept" in self.design.design_info.column_names:
+            if "Intercept" in design.design_info.column_names:
                 negctrl_mask[0,:] = True # allow intercepts for negative controls
 
             self.negctrl_mask = negctrl_mask
@@ -199,11 +226,11 @@ class DEModel:
 
     @property
     def design_matrix(self):
-        return self.design
+        return self.data.design
 
     @property
     def confounder_matrix(self):
-        return self.confounder_design
+        return self.data.confounder_design
 
     def _check_is_fit(self) -> None:
         if self.params is None:
@@ -219,7 +246,7 @@ class DEModel:
             raise ValueError(f"Column {col} not found in design matrix.")
         return self.design.design_info.column_names.index(col)
 
-    def fit(self, nsamples=6000, batch_size=1024):
+    def fit(self, nepochs=100, batch_size=32768, platform="gpu"):
         """Fit parameters to the dataset.
 
         Parameters
@@ -234,17 +261,32 @@ class DEModel:
         None
             Model parameters are stored in the self.params attribute.
         """
-        # TODO: We should try doing proper data loading and train on GPU.
-        numpyro.set_platform("cpu")
+        numpyro.set_platform(platform)
 
-        self.params = run_inference_vi(
-            self.adata.X,
-            self.A,
-            self.design,
-            self.confounder_design,
-            self.negctrl_mask,
-            batch_size=batch_size,
-            nsamples=nsamples)
+        negctrl_mask = jnp.array(self.negctrl_mask)
+
+        optimizer = numpyro.optim.Adam(step_size=0.02)
+        svi = SVI(model, guide, optimizer, loss=Trace_ELBO())
+        key = jax.random.PRNGKey(0)
+        ncells = len(self.data)
+
+        svi_state = None
+        for epoch in tqdm(range(nepochs), desc="Training epochs"):
+            agg_loss = 0.0
+            for X_batch, design_batch, confounder_batch, mask in self.data.iter_batches(batch_size):
+                if svi_state is None:
+                    svi_state = svi.init(key, ncells, X_batch, design_batch, confounder_batch, negctrl_mask, mask)
+
+                svi_state, loss = svi.update(
+                    svi_state, ncells, X_batch, design_batch, confounder_batch, negctrl_mask, mask)
+                agg_loss += loss
+            tqdm.write(f"Epoch {epoch} Loss: {agg_loss}")
+
+
+        self.params = {
+            k: np.asarray(v) for k, v in params.items()
+        }
+
 
     def _de_results(self, covariate: str|int, minfc, credible):
         self._check_is_fit()
