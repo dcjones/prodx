@@ -98,7 +98,7 @@ def guide(ncells, X, design, confounder_design: Optional[jax.Array], negctrl_mas
 
     σw_mu_q = numpyro.param("σw_mu_q", jnp.zeros(ncovariates))
     σw_sigma_q = numpyro.param("σw_sigma_q", jnp.ones(ncovariates), constraint=dist.constraints.positive)
-    σw_q = numpyro.sample("σw", dist.LogNormal(σw_mu_q, σw_sigma_q))
+    numpyro.sample("σw", dist.LogNormal(σw_mu_q, σw_sigma_q))
 
     w_mu_q = numpyro.param("w_mu_q", jnp.zeros((ncovariates, ngenes)))
     w_sigma_q = numpyro.param("w_sigma_q", jnp.ones((ncovariates, ngenes)), constraint=dist.constraints.positive)
@@ -246,7 +246,7 @@ class DEModel:
             raise ValueError(f"Column {col} not found in design matrix.")
         return self.design.design_info.column_names.index(col)
 
-    def fit(self, nepochs=100, batch_size=32768, platform="gpu"):
+    def fit(self, nepochs=400, batch_size=32768, platform="gpu"):
         """Fit parameters to the dataset.
 
         Parameters
@@ -275,16 +275,17 @@ class DEModel:
                 svi_state, ncells, X_batch, design_batch, confounder_batch, negctrl_mask, mask)
 
         svi_state = None
-        for epoch in tqdm(range(nepochs), desc="Training epochs"):
-            agg_loss = 0.0
+        prog = tqdm(range(nepochs), desc="Training epochs")
+        for epoch in prog:
+            epoch_loss = 0.0
             for X_batch, design_batch, confounder_batch, mask in self.data.iter_batches(batch_size):
                 if svi_state is None:
                     svi_state = svi.init(key, ncells, X_batch, design_batch, confounder_batch, negctrl_mask, mask)
 
                 svi_state, loss = jax.jit(update_fn, static_argnums=1)(
                     svi_state, ncells, X_batch, design_batch, confounder_batch, negctrl_mask, mask)
-                agg_loss += loss
-            tqdm.write(f"Epoch {epoch} Loss: {agg_loss}")
+                epoch_loss += loss
+            prog.set_postfix({"loss": f"{epoch_loss:.4f}"})
 
         params = svi.get_params(svi_state)
         self.params = {
