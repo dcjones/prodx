@@ -53,9 +53,9 @@ class Dataset:
                 X_batch = jnp.pad(X_batch, pad_width)
                 design_batch = jnp.pad(design_batch, pad_width)
                 confounder_design_batch = jnp.pad(confounder_design_batch, pad_width) if confounder_design_batch is not None else None
-                yield X_batch, design_batch, confounder_design_batch, mask
+                yield X_batch, design_batch, confounder_design_batch, jnp.array(mask)
             else:
-                yield X_batch, design_batch, confounder_design_batch, mask
+                yield X_batch, design_batch, confounder_design_batch, jnp.array(mask)
 
 
 # X: [ncells, ngenes]
@@ -270,6 +270,10 @@ class DEModel:
         key = jax.random.PRNGKey(0)
         ncells = len(self.data)
 
+        def update_fn(svi_state, ncells, X_batch, design_batch, confounder_batch, negctrl_mask, mask):
+            return svi.update(
+                svi_state, ncells, X_batch, design_batch, confounder_batch, negctrl_mask, mask)
+
         svi_state = None
         for epoch in tqdm(range(nepochs), desc="Training epochs"):
             agg_loss = 0.0
@@ -277,12 +281,12 @@ class DEModel:
                 if svi_state is None:
                     svi_state = svi.init(key, ncells, X_batch, design_batch, confounder_batch, negctrl_mask, mask)
 
-                svi_state, loss = svi.update(
+                svi_state, loss = jax.jit(update_fn, static_argnums=1)(
                     svi_state, ncells, X_batch, design_batch, confounder_batch, negctrl_mask, mask)
                 agg_loss += loss
             tqdm.write(f"Epoch {epoch} Loss: {agg_loss}")
 
-
+        params = svi.get_params(svi_state)
         self.params = {
             k: np.asarray(v) for k, v in params.items()
         }
