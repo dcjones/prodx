@@ -1,5 +1,5 @@
 from anndata import AnnData
-from jax.experimental.sparse import BCOO
+from jax.experimental.sparse import BCOO, bcoo_dot_general
 from numpy.typing import ArrayLike
 from numpyro.infer import SVI, Trace_ELBO
 from patsy import dmatrix
@@ -91,7 +91,9 @@ def model(
     ncells,
     X: jax.Array,
     design: jax.Array,
-    confounder_design: Optional[jax.Array],
+    confounder_design: jax.Array | None,
+    diffusion_matrix: BCOO | None,
+    diffusion_nneighbors: jax.Array | None,
     negctrl_mask: jax.Array,
     mask: jax.Array,
 ):
@@ -103,6 +105,9 @@ def model(
         "w", dist.Normal(jnp.zeros((ncovariates, ngenes)), jnp.expand_dims(σw, 1))
     )
     overdispersion = numpyro.sample("c", dist.HalfCauchy(jnp.full(ngenes, 10.0)))
+
+    # I guess this should be beta??
+    diffusion_rate = numpyro.sample(name="d", fn=dist.Beta(10, 1))
 
     if confounder_design is not None:
         nconfounders = confounder_design.shape[1]
@@ -127,6 +132,11 @@ def model(
         else:
             nb_mean = jnp.exp(base_exp)  # [batch_size, ngenes]
 
+        if diffusion_matrix is not None and diffusion_nneighbors is not None:
+            nb_mean = (diffusion_rate * diffusion_matrix) @ nb_mean + nb_mean
+
+        jax.debug.print("diffusion_rate: {}", diffusion_rate)
+
         numpyro.sample(
             "X",
             dist.NegativeBinomial2(
@@ -141,7 +151,9 @@ def guide(
     ncells,
     X,
     design,
-    confounder_design: Optional[jax.Array],
+    confounder_design: jax.Array | None,
+    _diffusion_matrix: BCOO | None,
+    _diffusion_nneighbors: jax.Array | None,
     negctrl_mask,
     mask: jax.Array,
 ):
@@ -167,6 +179,21 @@ def guide(
         "c_sigma_q", jnp.ones(ngenes), constraint=dist.constraints.positive
     )
     numpyro.sample("c", dist.LogNormal(c_mu_q, c_sigma_q))
+
+    d_log_alpha = numpyro.param(
+        "d_alpha",
+        init_value=np.full(1, 1e-1),
+        # constraint=dist.constraints.greater_than_eq(1),
+        constraint=dist.constraints.positive,
+    )
+    d_log_beta = numpyro.param(
+        "d_beta",
+        init_value=np.full(1, 1e-1),
+        # constraint=dist.constraints.greater_than_eq(1),
+        constraint=dist.constraints.positive,
+    )
+    jax.debug.print("d: {} {}", d_log_alpha, d_log_beta)
+    numpyro.sample("d", dist.Beta(jnp.exp(d_log_alpha), jnp.exp(d_log_beta)))
 
     if confounder_design is not None:
         nconfounders = confounder_design.shape[1]
@@ -285,11 +312,14 @@ class DEModel:
 
             edge_from = []
             edge_to = []
+            nneighbors = np.zeros(adata.shape[0], dtype=np.float32)
             for i in range(adata.shape[0]):
                 for j in tri_indices[tri_indptr[i] : tri_indptr[i + 1]]:
                     if i != j:
                         edge_from.append(i)
                         edge_to.append(j)
+                        nneighbors[i] += 1
+                        nneighbors[j] += 1
 
             edge_from = np.array(edge_from, dtype=np.int32)
             edge_to = np.array(edge_to, dtype=np.int32)
@@ -305,8 +335,10 @@ class DEModel:
                 (jnp.ones(len(edge_from)), edges),
                 shape=(adata.shape[0], adata.shape[0]),
             )
+            self.nneighbors = jnp.array(nneighbors)
         else:
             self.A = None
+            self.nneighbors = None
 
     @property
     def design_matrix(self):
@@ -346,6 +378,8 @@ class DEModel:
             X_batch,
             design_batch,
             confounder_batch,
+            diffusion_matrix,
+            diffusion_nneighbors,
             negctrl_mask,
             mask,
         ):
@@ -355,6 +389,8 @@ class DEModel:
                 X_batch,
                 design_batch,
                 confounder_batch,
+                diffusion_matrix,
+                diffusion_nneighbors,
                 negctrl_mask,
                 mask,
             )
@@ -372,6 +408,8 @@ class DEModel:
                     X_batch,
                     design_batch,
                     confounder_batch,
+                    self.A,
+                    self.nneighbors,
                     negctrl_mask,
                     mask,
                 )
@@ -382,6 +420,8 @@ class DEModel:
                 X_batch,
                 design_batch,
                 confounder_batch,
+                self.A,
+                self.nneighbors,
                 negctrl_mask,
                 mask,
             )
@@ -435,6 +475,8 @@ class DEModel:
                 X_batch,
                 design_batch,
                 confounder_batch,
+                None,
+                None,
                 negctrl_mask,
                 mask,
             )
