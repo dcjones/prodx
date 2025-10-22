@@ -1,16 +1,18 @@
 from anndata import AnnData
 from jax.experimental.sparse import BCOO, bcoo_dot_general
 from numpy.typing import ArrayLike
-from numpyro.infer import SVI, Trace_ELBO
+from numpyro.infer import SVI, Trace_ELBO, TraceMeanField_ELBO
 from patsy import dmatrix
+from patsy.design_info import DesignMatrix
 from scipy.sparse import coo_matrix
 from scipy.spatial import Delaunay
 from scipy.stats import norm
 from tqdm import tqdm
-from typing import Optional
+from typing import cast
 import jax
 import jax.numpy as jnp
 import numpy as np
+from numpy.typing import NDArray
 import numpyro
 import numpyro.distributions as dist
 import pandas as pd
@@ -20,7 +22,7 @@ import re
 # basic dataset representation to do minibatch sampling
 class Dataset:
     def __init__(
-        self, X: ArrayLike, design: ArrayLike, confounder_design: Optional[ArrayLike]
+        self, X: ArrayLike, design: ArrayLike, confounder_design: None | ArrayLike
     ):
         self.X = X  # leave this as potentially a csr matrix
         self.design = np.asarray(design)
@@ -88,7 +90,7 @@ class Dataset:
 # negctrl_mask: [ncovariates, ngenes]
 # batch_size: int
 def model(
-    ncells,
+    ncells: int,
     X: jax.Array,
     design: jax.Array,
     confounder_design: jax.Array | None,
@@ -100,19 +102,21 @@ def model(
     batch_size, ngenes = X.shape
     ncovariates = design.shape[1]
 
-    # TODO: Ohh, this maybe needs to be per-gene and per covariate
-    # σw = numpyro.sample("σw", dist.HalfCauchy(jnp.full(ncovariates, 1e-1)))
-    # σw = numpyro.sample("σw", dist.HalfCauchy(jnp.full(ncovariates, 1e-1)))
     σw = numpyro.sample("σw", dist.HalfCauchy(jnp.full((1, ngenes), 1e-1)))
-    # σw = numpyro.sample("σw", dist.HalfNormal(jnp.full((ncovariates, ngenes), 1e-3)))
 
+    b = numpyro.sample(
+        "b",
+        dist.Normal(jnp.full((1, ngenes), -1), 10.0),
+    )
     w = numpyro.sample(
-        # "w",
-        # dist.Normal(jnp.zeros((ncovariates, ngenes)), jnp.expand_dims(σw, 1)),
         "w",
-        dist.Normal(jnp.zeros((ncovariates, ngenes)), σw),
+        dist.Normal(jnp.zeros((ncovariates - 1, ngenes)), σw),
     )
 
+    # We are assuming here that the design matrix as an intercept term and it's at index 0
+    bw = jnp.concatenate([b, w], axis=0)
+
+    # jax.debug.print("mean(b): {}", b.mean())
     # jax.debug.print("mean(w): {}", w.mean())
     # jax.debug.print("w: {}", w[:, 0:5])
     # jax.debug.print("σw: {}", σw[:, 0:5])
@@ -147,7 +151,7 @@ def model(
         numpyro.handlers.mask(mask=mask),
         numpyro.plate("genes", ngenes, dim=-1),
     ):
-        base_exp = design @ (w * negctrl_mask)
+        base_exp = design @ (bw * negctrl_mask)
         if confounder_design is not None:
             # TODO: exclude cell weight if we decide to keep that
             nb_mean = jnp.exp(
@@ -176,6 +180,15 @@ def model(
             obs=X,
         )
 
+        # numpyro.sample(
+        #     "X",
+        #     dist.NegativeBinomial2(
+        #         mean=nb_mean,
+        #         concentration=jnp.expand_dims(jnp.reciprocal(overdispersion), 0),
+        #     ),
+        #     obs=np.zeros(X.shape),
+        # )
+
 
 def guide(
     ncells,
@@ -198,10 +211,18 @@ def guide(
     )
     numpyro.sample("σw", dist.LogNormal(σw_mu_q, σw_sigma_q))
 
-    w_mu_q = numpyro.param("w_mu_q", jnp.zeros((ncovariates, ngenes)))
+    b_mu_q = numpyro.param("b_mu_q", jnp.zeros((1, ngenes)))
+    b_sigma_q = numpyro.param(
+        "b_sigma_q",
+        jnp.ones((1, ngenes)),
+        constraint=dist.constraints.positive,
+    )
+    numpyro.sample("b", dist.Normal(b_mu_q, b_sigma_q))
+
+    w_mu_q = numpyro.param("w_mu_q", jnp.zeros((ncovariates - 1, ngenes)))
     w_sigma_q = numpyro.param(
         "w_sigma_q",
-        jnp.ones((ncovariates, ngenes)),
+        jnp.ones((ncovariates - 1, ngenes)),
         constraint=dist.constraints.positive,
     )
     numpyro.sample("w", dist.Normal(w_mu_q, w_sigma_q))
@@ -250,11 +271,18 @@ def guide(
 
 
 class DEModel:
+    params: None | dict[str, NDArray[np.float32]]
+    data: Dataset
+    genes: NDArray[np.str_]
+    design: DesignMatrix
+    negctrl_mask: NDArray[np.bool_]
+    A: None | BCOO
+
     def __init__(
         self,
         adata: AnnData,
         formula: str,
-        confounder_formula: Optional[str] = None,
+        confounder_formula: None | str = None,
         negctrl_pat: str = "^NegControl",
         mask_negctrls: bool = False,
         model_segmentation_error: bool = False,
@@ -268,7 +296,7 @@ class DEModel:
             The AnnData object containing gene expression data.
         formula : str
             The model formula for the fixed effects in R-style syntax.
-        confounder_formula : Optional[str], default=None
+        confounder_formula : None | str, default=None
             The model formula for confounder variables in R-style syntax.
         negctrl_pat : str, default="^NegControl"
             Regular expression pattern to identify negative control genes.
@@ -280,18 +308,21 @@ class DEModel:
             Maximum distance between cells to be considered adjacent.
         """
         self.params = None
-        design = dmatrix(formula, adata.obs)
+        design = cast(DesignMatrix, dmatrix(formula, adata.obs))
+
+        print(type(design))
         if confounder_formula is not None:
             confounder_design = dmatrix(confounder_formula, adata.obs)
             # TODO: We might forcibly exclude an Intercept column if there is one
         else:
             confounder_design = None
 
+        # TODO: deal with adata.X being potentially sparse, non-integer, etc.
         self.data = Dataset(adata.X, design, confounder_design)
-        self.genes = adata.var_names
+        self.genes = np.asarray(adata.var_names)
         self.design = design
 
-        ncovariates = design.shape[1]
+        ncovariates = int(design.shape[1])
         ngenes = len(self.genes)
 
         if mask_negctrls:
@@ -551,7 +582,9 @@ class DEModel:
 
         return posterior_mean, lower_credibles, upper_credibles, down_probs, up_probs
 
-    def de_results(self, covariate, minfc=1.5, credible=0.95):
+    def de_results(
+        self, covariate: str, minfc: float = 1.5, credible: float = 0.95
+    ) -> pd.DataFrame:
         """Return differential expression analysis results.
 
         Parameters
@@ -575,6 +608,7 @@ class DEModel:
             - de_down_prob: Probability of downregulation exceeding minfc
             - de_up_prob: Probability of upregulation exceeding minfc
             - de_prob: Total probability of differential expression
+            - abs_log2fc_bound: Lower bound on the absolute log fold change
         """
         j_intercept = self.get_design_column_idx("Intercept")
         intercept_posterior_mean = self.params["w_mu_q"][j_intercept, :]
