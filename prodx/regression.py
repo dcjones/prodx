@@ -117,7 +117,7 @@ def model(
     bw = jnp.concatenate([b, w], axis=0)
 
     # jax.debug.print("mean(b): {}", b.mean())
-    # jax.debug.print("mean(w): {}", w.mean())
+    jax.debug.print("mean(w): {}", w.mean())
     # jax.debug.print("w: {}", w[:, 0:5])
     # jax.debug.print("σw: {}", σw[:, 0:5])
     # jax.debug.print("w: {}", w)
@@ -146,6 +146,8 @@ def model(
             dist.LogNormal(jnp.zeros(nconfounders), jnp.full(nconfounders, 1.0)),
         )
 
+    gate_logits = numpyro.sample("g", dist.Normal(np.zeros(ngenes), 5.0))
+
     with (
         numpyro.plate("cells", ncells, subsample_size=batch_size, dim=-2),
         numpyro.handlers.mask(mask=mask),
@@ -164,28 +166,41 @@ def model(
             nb_mean = jnp.exp(base_exp)  # [batch_size, ngenes]
 
         if diffusion_matrix is not None and diffusion_nneighbors is not None:
-            # simplest model
+            # simplest model, we should really be doing this at the level of poisson rate
             nb_mean = diffusion_matrix @ (diffusion_rate * nb_mean) + nb_mean
 
             # We could just model some additional per-cell rate that we add onto nb_mean I guess?
 
-        # jax.debug.print("diffusion_rate: {}", diffusion_rate)
+        # likelihood = dist.NegativeBinomial2(
+        #     mean=nb_mean,
+        #     concentration=jnp.expand_dims(jnp.reciprocal(overdispersion), 0),
+        # )
+        #
+
+        jax.debug.print("mean(gate_logits): {}", gate_logits.mean())
+
+        # likelihood_dist = dist.ZeroInflatedNegativeBinomial2(
+        #     mean=nb_mean,
+        #     concentration=jnp.expand_dims(jnp.reciprocal(overdispersion), 0),
+        #     gate_logits=jnp.expand_dims(gate_logits, 0),
+        # )
+
+        likelihood_dist = dist.NegativeBinomial2(
+            mean=nb_mean,
+            concentration=jnp.expand_dims(jnp.reciprocal(overdispersion), 0),
+            # gate_logits=jnp.expand_dims(gate_logits, 0),
+        )
 
         numpyro.sample(
             "X",
-            dist.NegativeBinomial2(
-                mean=nb_mean,
-                concentration=jnp.expand_dims(jnp.reciprocal(overdispersion), 0),
-            ),
+            likelihood_dist,
             obs=X,
         )
 
+        # Fitting against all zeros, as a test.
         # numpyro.sample(
         #     "X",
-        #     dist.NegativeBinomial2(
-        #         mean=nb_mean,
-        #         concentration=jnp.expand_dims(jnp.reciprocal(overdispersion), 0),
-        #     ),
+        #     likelihood_dist,
         #     obs=np.zeros(X.shape),
         # )
 
@@ -211,7 +226,7 @@ def guide(
     )
     numpyro.sample("σw", dist.LogNormal(σw_mu_q, σw_sigma_q))
 
-    b_mu_q = numpyro.param("b_mu_q", jnp.zeros((1, ngenes)))
+    b_mu_q = numpyro.param("b_mu_q", jnp.full((1, ngenes), -1.0))
     b_sigma_q = numpyro.param(
         "b_sigma_q",
         jnp.ones((1, ngenes)),
@@ -250,6 +265,12 @@ def guide(
         "u_sigma_q", jnp.ones(ncells), constraint=dist.constraints.positive
     )
     numpyro.sample("u", dist.Normal(u_mu_q, u_sigma_q))
+
+    g_mu_q = numpyro.param("g_mu_q", jnp.zeros(ngenes))
+    g_sigma_q = numpyro.param(
+        "g_sigma_q", jnp.ones(ngenes), constraint=dist.constraints.positive
+    )
+    numpyro.sample("g", dist.Normal(g_mu_q, g_sigma_q))
 
     if confounder_design is not None:
         nconfounders = confounder_design.shape[1]
