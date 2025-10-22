@@ -100,14 +100,37 @@ def model(
     batch_size, ngenes = X.shape
     ncovariates = design.shape[1]
 
-    σw = numpyro.sample("σw", dist.HalfCauchy(jnp.full(ncovariates, 1e-1)))
+    # TODO: Ohh, this maybe needs to be per-gene and per covariate
+    # σw = numpyro.sample("σw", dist.HalfCauchy(jnp.full(ncovariates, 1e-1)))
+    # σw = numpyro.sample("σw", dist.HalfCauchy(jnp.full(ncovariates, 1e-1)))
+    σw = numpyro.sample("σw", dist.HalfCauchy(jnp.full((1, ngenes), 1e-1)))
+    # σw = numpyro.sample("σw", dist.HalfNormal(jnp.full((ncovariates, ngenes), 1e-3)))
+
     w = numpyro.sample(
-        "w", dist.Normal(jnp.zeros((ncovariates, ngenes)), jnp.expand_dims(σw, 1))
+        # "w",
+        # dist.Normal(jnp.zeros((ncovariates, ngenes)), jnp.expand_dims(σw, 1)),
+        "w",
+        dist.Normal(jnp.zeros((ncovariates, ngenes)), σw),
     )
+
+    # jax.debug.print("mean(w): {}", w.mean())
+    # jax.debug.print("w: {}", w[:, 0:5])
+    # jax.debug.print("σw: {}", σw[:, 0:5])
+    # jax.debug.print("w: {}", w)
+    # jax.debug.print("σw: {}", σw)
+    # jax.debug.print("mean(w): {}", w.mean())
+    # jax.debug.print("mean(σw): {}", σw.mean())
+
     overdispersion = numpyro.sample("c", dist.HalfCauchy(jnp.full(ngenes, 10.0)))
 
     # I guess this should be beta??
-    diffusion_rate = numpyro.sample(name="d", fn=dist.Beta(10, 1))
+    diffusion_rate = numpyro.sample(
+        name="d", fn=dist.Beta(jnp.full(ngenes, 10.0), jnp.full(ngenes, 1.0))
+    )
+
+    # cell_weight = numpyro.sample(
+    #     name="u", fn=dist.Normal(jnp.full(ncells, 0.0), jnp.full(ncells, 1e-1))
+    # )
 
     if confounder_design is not None:
         nconfounders = confounder_design.shape[1]
@@ -126,16 +149,23 @@ def model(
     ):
         base_exp = design @ (w * negctrl_mask)
         if confounder_design is not None:
+            # TODO: exclude cell weight if we decide to keep that
             nb_mean = jnp.exp(
                 base_exp + confounder_design @ jnp.expand_dims(b_mul, 1)
             ) + confounder_design @ jnp.expand_dims(b_add, 1)  # [batch_size, ngenes]
         else:
+            # nb_mean = jnp.exp(
+            #     base_exp + jnp.expand_dims(cell_weight, 1)
+            # )  # [batch_size, ngenes]
             nb_mean = jnp.exp(base_exp)  # [batch_size, ngenes]
 
         if diffusion_matrix is not None and diffusion_nneighbors is not None:
-            nb_mean = (diffusion_rate * diffusion_matrix) @ nb_mean + nb_mean
+            # simplest model
+            nb_mean = diffusion_matrix @ (diffusion_rate * nb_mean) + nb_mean
 
-        jax.debug.print("diffusion_rate: {}", diffusion_rate)
+            # We could just model some additional per-cell rate that we add onto nb_mean I guess?
+
+        # jax.debug.print("diffusion_rate: {}", diffusion_rate)
 
         numpyro.sample(
             "X",
@@ -157,12 +187,14 @@ def guide(
     negctrl_mask,
     mask: jax.Array,
 ):
-    ncells, ngenes = X.shape
+    _ncells, ngenes = X.shape
     ncovariates = design.shape[1]
 
-    σw_mu_q = numpyro.param("σw_mu_q", jnp.zeros(ncovariates))
+    σw_mu_q = numpyro.param("σw_mu_q", jnp.zeros((1, ngenes)))
     σw_sigma_q = numpyro.param(
-        "σw_sigma_q", jnp.ones(ncovariates), constraint=dist.constraints.positive
+        "σw_sigma_q",
+        jnp.ones((1, ngenes)),
+        constraint=dist.constraints.positive,
     )
     numpyro.sample("σw", dist.LogNormal(σw_mu_q, σw_sigma_q))
 
@@ -180,20 +212,23 @@ def guide(
     )
     numpyro.sample("c", dist.LogNormal(c_mu_q, c_sigma_q))
 
-    d_log_alpha = numpyro.param(
-        "d_alpha",
+    d_log_alpha_q = numpyro.param(
+        "d_alpha_q",
         init_value=np.full(1, 1e-1),
-        # constraint=dist.constraints.greater_than_eq(1),
         constraint=dist.constraints.positive,
     )
-    d_log_beta = numpyro.param(
-        "d_beta",
-        init_value=np.full(1, 1e-1),
-        # constraint=dist.constraints.greater_than_eq(1),
+    d_log_beta_q = numpyro.param(
+        "d_beta_q",
+        init_value=np.full(ngenes, 1e-1),
         constraint=dist.constraints.positive,
     )
-    jax.debug.print("d: {} {}", d_log_alpha, d_log_beta)
-    numpyro.sample("d", dist.Beta(jnp.exp(d_log_alpha), jnp.exp(d_log_beta)))
+    numpyro.sample("d", dist.Beta(jnp.exp(d_log_alpha_q), jnp.exp(d_log_beta_q)))
+
+    u_mu_q = numpyro.param("u_mu_q", jnp.zeros(ncells))
+    u_sigma_q = numpyro.param(
+        "u_sigma_q", jnp.ones(ncells), constraint=dist.constraints.positive
+    )
+    numpyro.sample("u", dist.Normal(u_mu_q, u_sigma_q))
 
     if confounder_design is not None:
         nconfounders = confounder_design.shape[1]
@@ -214,29 +249,6 @@ def guide(
         numpyro.sample("b_add", dist.LogNormal(b_add_mu_q, b_add_sigma_q))
 
 
-def run_inference_vi(
-    X, A, design, confounder_design, negctrl_mask, batch_size, nsamples
-):
-    optimizer = numpyro.optim.Adam(step_size=0.02)
-    svi = SVI(model, guide, optimizer, loss=Trace_ELBO())
-
-    key = jax.random.PRNGKey(0)
-    (params, _, _) = svi.run(
-        key,
-        nsamples,
-        X=jnp.array(X, dtype=jnp.float32),
-        A=A,
-        design=jnp.array(design, dtype=jnp.float32),
-        confounder_design=jnp.array(confounder_design, dtype=jnp.float32)
-        if confounder_design is not None
-        else None,
-        negctrl_mask=jnp.array(negctrl_mask, dtype=jnp.float32),
-        batch_size=batch_size,
-    )
-    params = {k: np.asarray(v) for k, v in params.items()}
-    return params
-
-
 class DEModel:
     def __init__(
         self,
@@ -246,7 +258,7 @@ class DEModel:
         negctrl_pat: str = "^NegControl",
         mask_negctrls: bool = False,
         model_segmentation_error: bool = False,
-        max_edge_dist=15.0,
+        max_edge_dist=25.0,
     ):
         """A model for performing differential expression analysis.
 
@@ -312,20 +324,22 @@ class DEModel:
 
             edge_from = []
             edge_to = []
-            nneighbors = np.zeros(adata.shape[0], dtype=np.float32)
+
             for i in range(adata.shape[0]):
                 for j in tri_indices[tri_indptr[i] : tri_indptr[i + 1]]:
                     if i != j:
                         edge_from.append(i)
                         edge_to.append(j)
-                        nneighbors[i] += 1
-                        nneighbors[j] += 1
 
             edge_from = np.array(edge_from, dtype=np.int32)
             edge_to = np.array(edge_to, dtype=np.int32)
 
             distances = np.linalg.norm(xys[edge_from] - xys[edge_to], axis=1)
             distance_mask = distances <= max_edge_dist
+
+            nneighbors = np.zeros(adata.shape[0], dtype=np.float32)
+            for i in edge_from[distance_mask]:
+                nneighbors[i] += 1
 
             edge_from = edge_from[distance_mask]
             edge_to = edge_to[distance_mask]
