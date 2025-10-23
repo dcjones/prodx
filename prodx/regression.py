@@ -574,6 +574,75 @@ class DEModel:
         params = svi.get_params(svi_state)
         self.params = {k: np.asarray(v) for k, v in params.items()}
 
+    def _estimate_abs_effect_size(
+        self, covariate, min_shift, credible, nsamples: int = 1000
+    ):
+        print("estimate_abs_effect_size")
+        self._check_is_fit()
+        j = self.get_design_column_idx(covariate)
+
+        design = self.data.design  # [ncells, ncovariates]
+
+        w_mu = self.params["w_mu_q"]  # [ncovariates, ngenes]
+        w_sigma = self.params["w_sigma_q"]  # [ncovariates, ngenes]
+
+        ngenes = w_mu.shape[1]
+
+        design_sansj = np.delete(design, j, 1)  # [ncells, ncovariates - 1]
+        w_mu_sansj = np.delete(w_mu, j, 0)  # [ncovariates - 1, ngenes]
+        w_sigma_sansj = np.delete(w_sigma, j, 0)  # [ncovariates - 1, ngenes]
+
+        cell_mu_sansj = jnp.array(design_sansj @ w_mu_sansj)
+        cell_sigma_sansj = jnp.array(np.sqrt(design_sansj @ np.square(w_sigma_sansj)))
+
+        design_j = design[:, j : j + 1]  # [ncells, 1]
+        w_mu_j = w_mu[j : j + 1, :]  # [1, ngenes]
+        w_sigma_j = w_sigma[j : j + 1, :]  # [1, ngenes]
+
+        cell_mu_j = jnp.array(design_j @ w_mu_j)
+        cell_sigma_j = jnp.array(np.sqrt(design_j @ np.square(w_sigma_j)))
+
+        abs_effect_mean = np.zeros(ngenes, dtype=np.float32)
+
+        def sample_diff(key, cell_mu_sansj, cell_sigma_sansj, cell_mu_j, cell_sigma_j):
+            log_expr0 = (
+                jax.random.normal(key, cell_mu_sansj.shape) * cell_sigma_sansj
+                + cell_mu_sansj
+            )
+
+            log_expr1 = (
+                log_expr0
+                + jax.random.normal(key, cell_mu_j.shape) * cell_sigma_j
+                + cell_mu_j
+            )
+
+            abs_effect_sample = (
+                jnp.exp(log_expr0 + log_expr1) - jnp.exp(log_expr0)
+            ).mean(axis=0)
+
+            return abs_effect_sample
+
+        key = jax.random.PRNGKey(0)
+        for sample_num in range(nsamples):
+            print(sample_num)
+            key, sample_key = jax.random.split(key)
+
+            abs_effect_mean += np.array(
+                jax.jit(sample_diff)(
+                    key,
+                    cell_mu_sansj,
+                    cell_sigma_sansj,
+                    cell_mu_j,
+                    cell_sigma_j,
+                )
+            )
+
+        abs_effect_mean /= nsamples
+
+        print(abs_effect_mean)
+
+        # TODO: Do we have to sample?
+
     def _de_results(self, covariate: str | int, minfc, credible):
         self._check_is_fit()
         log_minfc = np.log(minfc)
@@ -627,6 +696,9 @@ class DEModel:
         """
         j_intercept = self.get_design_column_idx("Intercept")
         intercept_posterior_mean = self.params["w_mu_q"][j_intercept, :]
+
+        # TODO: figure out what this reports
+        self._estimate_abs_effect_size(covariate, credible, 0.1)
 
         posterior_mean, lower_credibles, upper_credibles, down_probs, up_probs = (
             self._de_results(covariate, minfc, credible)
