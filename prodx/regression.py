@@ -102,28 +102,23 @@ def model(
     batch_size, ngenes = X.shape
     ncovariates = design.shape[1]
 
-    σw = numpyro.sample("σw", dist.HalfCauchy(jnp.full((1, ngenes), 1e-1)))
+    # "global" shrinkage that is per-gene
+    σw = numpyro.sample("σw", dist.HalfCauchy(jnp.full((1, ngenes), 1.0)))
+    # "local" shrinkage that is per-covariate and per-gene.
+    λw = numpyro.sample("λw", dist.HalfCauchy(jnp.full((ncovariates - 1, ngenes), 1.0)))
 
     b = numpyro.sample(
         "b",
-        dist.Normal(jnp.full((1, ngenes), -1), 10.0),
+        dist.Normal(jnp.full((1, ngenes), -1), 5.0),
     )
+
     w = numpyro.sample(
         "w",
-        dist.Normal(jnp.zeros((ncovariates - 1, ngenes)), σw),
+        dist.Normal(jnp.zeros((ncovariates - 1, ngenes)), σw * λw),
     )
 
     # We are assuming here that the design matrix as an intercept term and it's at index 0
     bw = jnp.concatenate([b, w], axis=0)
-
-    # jax.debug.print("mean(b): {}", b.mean())
-    jax.debug.print("mean(w): {}", w.mean())
-    # jax.debug.print("w: {}", w[:, 0:5])
-    # jax.debug.print("σw: {}", σw[:, 0:5])
-    # jax.debug.print("w: {}", w)
-    # jax.debug.print("σw: {}", σw)
-    # jax.debug.print("mean(w): {}", w.mean())
-    # jax.debug.print("mean(σw): {}", σw.mean())
 
     overdispersion = numpyro.sample("c", dist.HalfCauchy(jnp.full(ngenes, 10.0)))
 
@@ -131,10 +126,6 @@ def model(
     diffusion_rate = numpyro.sample(
         name="d", fn=dist.Beta(jnp.full(ngenes, 10.0), jnp.full(ngenes, 1.0))
     )
-
-    # cell_weight = numpyro.sample(
-    #     name="u", fn=dist.Normal(jnp.full(ncells, 0.0), jnp.full(ncells, 1e-1))
-    # )
 
     if confounder_design is not None:
         nconfounders = confounder_design.shape[1]
@@ -146,7 +137,7 @@ def model(
             dist.LogNormal(jnp.zeros(nconfounders), jnp.full(nconfounders, 1.0)),
         )
 
-    gate_logits = numpyro.sample("g", dist.Normal(np.zeros(ngenes), 5.0))
+    # gate_logits = numpyro.sample("g", dist.Normal(np.zeros(ngenes), 5.0))
 
     with (
         numpyro.plate("cells", ncells, subsample_size=batch_size, dim=-2),
@@ -177,7 +168,7 @@ def model(
         # )
         #
 
-        jax.debug.print("mean(gate_logits): {}", gate_logits.mean())
+        # jax.debug.print("mean(gate_logits): {}", gate_logits.mean())
 
         # likelihood_dist = dist.ZeroInflatedNegativeBinomial2(
         #     mean=nb_mean,
@@ -188,7 +179,6 @@ def model(
         likelihood_dist = dist.NegativeBinomial2(
             mean=nb_mean,
             concentration=jnp.expand_dims(jnp.reciprocal(overdispersion), 0),
-            # gate_logits=jnp.expand_dims(gate_logits, 0),
         )
 
         numpyro.sample(
@@ -226,7 +216,15 @@ def guide(
     )
     numpyro.sample("σw", dist.LogNormal(σw_mu_q, σw_sigma_q))
 
-    b_mu_q = numpyro.param("b_mu_q", jnp.full((1, ngenes), -1.0))
+    λw_mu_q = numpyro.param("λw_mu_q", jnp.zeros((ncovariates - 1, ngenes)))
+    λw_sigma_q = numpyro.param(
+        "λw_sigma_q",
+        jnp.ones((ncovariates - 1, ngenes)),
+        constraint=dist.constraints.positive,
+    )
+    numpyro.sample("λw", dist.LogNormal(λw_mu_q, λw_sigma_q))
+
+    b_mu_q = numpyro.param("b_mu_q", jnp.full((1, ngenes), 0.0))
     b_sigma_q = numpyro.param(
         "b_sigma_q",
         jnp.ones((1, ngenes)),
@@ -428,7 +426,8 @@ class DEModel:
             raise ValueError("Column must be string.")
         if col not in self.design.design_info.column_names:
             raise ValueError(f"Column {col} not found in design matrix.")
-        return self.design.design_info.column_names.index(col)
+        # '-1' here because we split the intercept off to give it a different prior
+        return self.design.design_info.column_names.index(col) - 1
 
     def _fit_unbatched(self, nepochs: int, platform: str):
         numpyro.set_platform(platform)
@@ -631,8 +630,8 @@ class DEModel:
             - de_prob: Total probability of differential expression
             - abs_log2fc_bound: Lower bound on the absolute log fold change
         """
-        j_intercept = self.get_design_column_idx("Intercept")
-        intercept_posterior_mean = self.params["w_mu_q"][j_intercept, :]
+        intercept_posterior_mean = self.params["b_mu_q"][0, :]
+
         posterior_mean, lower_credibles, upper_credibles, down_probs, up_probs = (
             self._de_results(covariate, minfc, credible)
         )
