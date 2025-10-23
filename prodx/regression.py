@@ -107,18 +107,14 @@ def model(
     # "local" shrinkage that is per-covariate and per-gene.
     λw = numpyro.sample("λw", dist.HalfCauchy(jnp.full((ncovariates - 1, ngenes), 1.0)))
 
-    b = numpyro.sample(
-        "b",
-        dist.Normal(jnp.full((1, ngenes), -1), 5.0),
-    )
-
+    # We are assuming here that the design matrix as an intercept term and it's at index 0
     w = numpyro.sample(
         "w",
-        dist.Normal(jnp.zeros((ncovariates - 1, ngenes)), σw * λw),
+        dist.Normal(
+            jnp.zeros((ncovariates, ngenes)),
+            jnp.concatenate([jnp.full((1, ngenes), 5.0), λw * σw], axis=0),
+        ),
     )
-
-    # We are assuming here that the design matrix as an intercept term and it's at index 0
-    bw = jnp.concatenate([b, w], axis=0)
 
     overdispersion = numpyro.sample("c", dist.HalfCauchy(jnp.full(ngenes, 10.0)))
 
@@ -144,7 +140,7 @@ def model(
         numpyro.handlers.mask(mask=mask),
         numpyro.plate("genes", ngenes, dim=-1),
     ):
-        base_exp = design @ (bw * negctrl_mask)
+        base_exp = design @ (w * negctrl_mask)
         if confounder_design is not None:
             # TODO: exclude cell weight if we decide to keep that
             nb_mean = jnp.exp(
@@ -224,18 +220,18 @@ def guide(
     )
     numpyro.sample("λw", dist.LogNormal(λw_mu_q, λw_sigma_q))
 
-    b_mu_q = numpyro.param("b_mu_q", jnp.full((1, ngenes), 0.0))
-    b_sigma_q = numpyro.param(
-        "b_sigma_q",
-        jnp.ones((1, ngenes)),
-        constraint=dist.constraints.positive,
-    )
-    numpyro.sample("b", dist.Normal(b_mu_q, b_sigma_q))
+    # b_mu_q = numpyro.param("b_mu_q", jnp.full((1, ngenes), 0.0))
+    # b_sigma_q = numpyro.param(
+    #     "b_sigma_q",
+    #     jnp.ones((1, ngenes)),
+    #     constraint=dist.constraints.positive,
+    # )
+    # numpyro.sample("b", dist.Normal(b_mu_q, b_sigma_q))
 
-    w_mu_q = numpyro.param("w_mu_q", jnp.zeros((ncovariates - 1, ngenes)))
+    w_mu_q = numpyro.param("w_mu_q", jnp.zeros((ncovariates, ngenes)))
     w_sigma_q = numpyro.param(
         "w_sigma_q",
-        jnp.ones((ncovariates - 1, ngenes)),
+        jnp.ones((ncovariates, ngenes)),
         constraint=dist.constraints.positive,
     )
     numpyro.sample("w", dist.Normal(w_mu_q, w_sigma_q))
@@ -426,8 +422,7 @@ class DEModel:
             raise ValueError("Column must be string.")
         if col not in self.design.design_info.column_names:
             raise ValueError(f"Column {col} not found in design matrix.")
-        # '-1' here because we split the intercept off to give it a different prior
-        return self.design.design_info.column_names.index(col) - 1
+        return self.design.design_info.column_names.index(col)
 
     def _fit_unbatched(self, nepochs: int, platform: str):
         numpyro.set_platform(platform)
@@ -630,7 +625,8 @@ class DEModel:
             - de_prob: Total probability of differential expression
             - abs_log2fc_bound: Lower bound on the absolute log fold change
         """
-        intercept_posterior_mean = self.params["b_mu_q"][0, :]
+        j_intercept = self.get_design_column_idx("Intercept")
+        intercept_posterior_mean = self.params["w_mu_q"][j_intercept, :]
 
         posterior_mean, lower_credibles, upper_credibles, down_probs, up_probs = (
             self._de_results(covariate, minfc, credible)
@@ -638,6 +634,9 @@ class DEModel:
         effect_size = np.maximum(
             np.clip(lower_credibles, 0, np.inf), -np.clip(upper_credibles, -np.inf, 0)
         )
+
+        # I think what we really need to estimate quantiles for absolute effect size, but for that
+        # we have to consider the other coefficients.
 
         return pd.DataFrame(
             dict(
@@ -651,4 +650,7 @@ class DEModel:
                 de_prob=down_probs + up_probs,
                 abs_log2fc_bound=effect_size / np.log(2),
             )
-        ).sort_values("abs_log2fc_bound", ascending=False)
+        )
+
+        # Probably a bad idea, so we can compare to the adata without joining.
+        # .sort_values("abs_log2fc_bound", ascending=False)
