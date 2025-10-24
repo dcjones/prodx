@@ -120,7 +120,7 @@ def model(
 
     # I guess this should be beta??
     diffusion_rate = numpyro.sample(
-        name="d", fn=dist.Beta(jnp.full(ngenes, 10.0), jnp.full(ngenes, 1.0))
+        name="d", fn=dist.Beta(jnp.full(ncells, 10.0), jnp.full(ncells, 1.0))
     )
 
     if confounder_design is not None:
@@ -154,7 +154,10 @@ def model(
 
         if diffusion_matrix is not None and diffusion_nneighbors is not None:
             # simplest model, we should really be doing this at the level of poisson rate
-            nb_mean = diffusion_matrix @ (diffusion_rate * nb_mean) + nb_mean
+            nb_mean = (
+                diffusion_matrix @ (jnp.expand_dims(diffusion_rate, -1) * nb_mean)
+                + nb_mean
+            )
 
             # We could just model some additional per-cell rate that we add onto nb_mean I guess?
 
@@ -244,12 +247,12 @@ def guide(
 
     d_log_alpha_q = numpyro.param(
         "d_alpha_q",
-        init_value=np.full(ngenes, 1e-1),
+        init_value=np.full(ncells, 1e-1),
         constraint=dist.constraints.positive,
     )
     d_log_beta_q = numpyro.param(
         "d_beta_q",
-        init_value=np.full(ngenes, 1e-1),
+        init_value=np.full(ncells, 1e-1),
         constraint=dist.constraints.positive,
     )
     numpyro.sample("d", dist.Beta(jnp.exp(d_log_alpha_q), jnp.exp(d_log_beta_q)))
