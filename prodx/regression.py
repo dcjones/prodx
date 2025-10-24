@@ -574,12 +574,13 @@ class DEModel:
         params = svi.get_params(svi_state)
         self.params = {k: np.asarray(v) for k, v in params.items()}
 
-    def _estimate_abs_effect_size(
-        self, covariate, min_shift, credible, nsamples: int = 1000
+    def _estimate_effect_size(
+        self, covariate, min_shift, min_fc, credible, nsamples: int = 1000
     ):
         print("estimate_abs_effect_size")
         self._check_is_fit()
         j = self.get_design_column_idx(covariate)
+        log_min_fc = np.log(min_fc)
 
         design = self.data.design  # [ncells, ncovariates]
 
@@ -588,64 +589,82 @@ class DEModel:
 
         ngenes = w_mu.shape[1]
 
+        design_j = design[:, j : j + 1]  # [ncells, 1]
+
+        # TODO: This logic dosen't necessarily work for entries that aren't binary
+        cell_mask = (design_j != 0).squeeze()
+
         design_sansj = np.delete(design, j, 1)  # [ncells, ncovariates - 1]
         w_mu_sansj = np.delete(w_mu, j, 0)  # [ncovariates - 1, ngenes]
         w_sigma_sansj = np.delete(w_sigma, j, 0)  # [ncovariates - 1, ngenes]
 
-        cell_mu_sansj = jnp.array(design_sansj @ w_mu_sansj)
-        cell_sigma_sansj = jnp.array(np.sqrt(design_sansj @ np.square(w_sigma_sansj)))
+        cell_mu_sansj = jnp.array(design_sansj[cell_mask, :] @ w_mu_sansj)
+        cell_sigma_sansj = jnp.array(
+            np.sqrt(design_sansj[cell_mask, :] @ np.square(w_sigma_sansj))
+        )
 
-        design_j = design[:, j : j + 1]  # [ncells, 1]
         w_mu_j = w_mu[j : j + 1, :]  # [1, ngenes]
         w_sigma_j = w_sigma[j : j + 1, :]  # [1, ngenes]
 
-        cell_mu_j = jnp.array(design_j @ w_mu_j)
-        cell_sigma_j = jnp.array(np.sqrt(design_j @ np.square(w_sigma_j)))
-
-        abs_effect_mean = np.zeros(ngenes, dtype=np.float32)
+        cell_mu_j = jnp.array(design_j[cell_mask, :] @ w_mu_j)
+        cell_sigma_j = jnp.array(np.sqrt(design_j[cell_mask, :] @ np.square(w_sigma_j)))
 
         def sample_diff(key, cell_mu_sansj, cell_sigma_sansj, cell_mu_j, cell_sigma_j):
+            key1, key2 = jax.random.split(key)
+
             log_expr0 = (
-                jax.random.normal(key, cell_mu_sansj.shape) * cell_sigma_sansj
+                jax.random.normal(key1, cell_mu_sansj.shape) * cell_sigma_sansj
                 + cell_mu_sansj
             )
 
-            log_expr1 = (
-                log_expr0
-                + jax.random.normal(key, cell_mu_j.shape) * cell_sigma_j
-                + cell_mu_j
+            log_w_j = (
+                jax.random.normal(key2, cell_mu_j.shape) * cell_sigma_j + cell_mu_j
             )
+            log_expr1 = log_expr0 + log_w_j
 
-            abs_effect_sample = (
-                jnp.exp(log_expr0 + log_expr1) - jnp.exp(log_expr0)
-            ).mean(axis=0)
+            abs_effect_sample = (jnp.exp(log_expr1) - jnp.exp(log_expr0)).mean(axis=0)
 
-            return abs_effect_sample
+            log_effect_sample = log_w_j.mean(axis=0)
+            return log_effect_sample, abs_effect_sample
+
+        abs_effect_mean = np.zeros(ngenes, dtype=np.float32)
+        log_effect_mean = np.zeros(ngenes, dtype=np.float32)
+        up_prob = np.zeros(ngenes, dtype=np.float32)
+        down_prob = np.zeros(ngenes, dtype=np.float32)
 
         key = jax.random.PRNGKey(0)
         for sample_num in range(nsamples):
-            print(sample_num)
             key, sample_key = jax.random.split(key)
-
-            abs_effect_mean += np.array(
-                jax.jit(sample_diff)(
-                    key,
-                    cell_mu_sansj,
-                    cell_sigma_sansj,
-                    cell_mu_j,
-                    cell_sigma_j,
-                )
+            log_effect_sample, abs_effect_sample = jax.jit(sample_diff)(
+                sample_key,
+                cell_mu_sansj,
+                cell_sigma_sansj,
+                cell_mu_j,
+                cell_sigma_j,
             )
 
+            up_prob += np.array(
+                (log_effect_sample > log_min_fc) & (abs_effect_sample > min_shift)
+            )
+            down_prob += np.array(
+                (log_effect_sample < -log_min_fc) & (abs_effect_sample < -min_shift)
+            )
+
+            abs_effect_mean += abs_effect_sample
+            log_effect_mean += log_effect_sample
+
+        up_prob /= nsamples
+        down_prob /= nsamples
         abs_effect_mean /= nsamples
+        log_effect_mean /= nsamples
 
-        print(abs_effect_mean)
+        return up_prob, down_prob, abs_effect_mean, log_effect_mean
 
-        # TODO: Do we have to sample?
-
-    def _de_results(self, covariate: str | int, minfc, credible):
+    def _de_results(
+        self, covariate: str | int, min_shift: float, min_fc: float, credible: float
+    ):
         self._check_is_fit()
-        log_minfc = np.log(minfc)
+        log_minfc = np.log(min_fc)
         j = self.get_design_column_idx(covariate)
         ngenes = self.params["w_mu_q"].shape[1]
 
@@ -667,7 +686,11 @@ class DEModel:
         return posterior_mean, lower_credibles, upper_credibles, down_probs, up_probs
 
     def de_results(
-        self, covariate: str, minfc: float = 1.5, credible: float = 0.95
+        self,
+        covariate: str,
+        min_shift: float = 0.1,
+        min_fc: float = 1.5,
+        credible: float = 0.95,
     ) -> pd.DataFrame:
         """Return differential expression analysis results.
 
@@ -698,29 +721,48 @@ class DEModel:
         intercept_posterior_mean = self.params["w_mu_q"][j_intercept, :]
 
         # TODO: figure out what this reports
-        self._estimate_abs_effect_size(covariate, credible, 0.1)
+        #
+        #
+        up_prob, down_prob, abs_effect_mean, log_effect_mean = (
+            self._estimate_effect_size(covariate, min_shift, min_fc, credible)
+        )
 
-        posterior_mean, lower_credibles, upper_credibles, down_probs, up_probs = (
-            self._de_results(covariate, minfc, credible)
-        )
-        effect_size = np.maximum(
-            np.clip(lower_credibles, 0, np.inf), -np.clip(upper_credibles, -np.inf, 0)
-        )
+        # posterior_mean, lower_credibles, upper_credibles, down_probs, up_probs = (
+        #     self._de_results(covariate, min_shift, min_fc, credible)
+        # )
+        # effect_size = np.maximum(
+        #     np.clip(lower_credibles, 0, np.inf), -np.clip(upper_credibles, -np.inf, 0)
+        # )
 
         # I think what we really need to estimate quantiles for absolute effect size, but for that
         # we have to consider the other coefficients.
+
+        # return pd.DataFrame(
+        #     dict(
+        #         gene=self.genes,
+        #         log10_base_mean=intercept_posterior_mean / np.log(10),
+        #         log2fc=posterior_mean / np.log(2),
+        #         log2fc_lower_credible=lower_credibles / np.log(2),
+        #         log2fc_upper_credible=upper_credibles / np.log(2),
+        #         de_down_prob=down_probs,
+        #         de_up_prob=up_probs,
+        #         de_prob=down_probs + up_probs,
+        #         abs_log2fc_bound=effect_size / np.log(2),
+        #     )
+        # )
 
         return pd.DataFrame(
             dict(
                 gene=self.genes,
                 log10_base_mean=intercept_posterior_mean / np.log(10),
-                log2fc=posterior_mean / np.log(2),
-                log2fc_lower_credible=lower_credibles / np.log(2),
-                log2fc_upper_credible=upper_credibles / np.log(2),
-                de_down_prob=down_probs,
-                de_up_prob=up_probs,
-                de_prob=down_probs + up_probs,
-                abs_log2fc_bound=effect_size / np.log(2),
+                log2fc=log_effect_mean / np.log(2),
+                shift=abs_effect_mean,
+                # log2fc_lower_credible=lower_credibles / np.log(2),
+                # log2fc_upper_credible=upper_credibles / np.log(2),
+                de_down_prob=down_prob,
+                de_up_prob=up_prob,
+                de_prob=down_prob + up_prob,
+                # abs_log2fc_bound=effect_size / np.log(2),
             )
         )
 
