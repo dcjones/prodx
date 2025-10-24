@@ -244,7 +244,7 @@ def guide(
 
     d_log_alpha_q = numpyro.param(
         "d_alpha_q",
-        init_value=np.full(1, 1e-1),
+        init_value=np.full(ngenes, 1e-1),
         constraint=dist.constraints.positive,
     )
     d_log_beta_q = numpyro.param(
